@@ -20,6 +20,7 @@ TIMER2_RELOAD EQU ((65536-(CLK/(12*TIMER2_RATE))))
 
 SOUND_OUT     equ P1.5
 UPDOWN        equ SWA.0
+Play_beeps_Switch   equ SWA.1
 
 ; Reset vector
 org 0x0000
@@ -90,7 +91,7 @@ Timer0_Init:
 	mov TL0, #low(TIMER0_RELOAD)
 	; Enable the timer and interrupts
     setb ET0  ; Enable timer 0 interrupt
-    setb TR0  ; Start timer 0
+    clr TR0  ; Start timer 0
 	ret
 
 ;---------------------------------;
@@ -102,7 +103,7 @@ Timer0_ISR:
 	;clr TF0  ; According to the data sheet this is done for us already.
 	mov TH0, #high(TIMER0_RELOAD) ; Timer 0 doesn't have autoreload in the CV-8052
 	mov TL0, #low(TIMER0_RELOAD)
-	cpl SOUND_OUT ; Connect speaker to P3.7!
+	;cpl SOUND_OUT ; Connect speaker to P3.7!
 	reti
 
 ;---------------------------------;
@@ -153,7 +154,7 @@ Inc_Done:
 	setb half_seconds_flag ; Let the main program know half second had passed
 	; Toggle LEDR0 so it blinks
 	cpl LEDRA.0
-	cpl TR0 ; Enable/disable timer/counter 0. This line creates a beep-silence-beep-silence sound.
+	;cpl TR0 ; Enable/disable timer/counter 0. This line creates a beep-silence-beep-silence sound.
 	; Reset to zero the milli-seconds counter, it is a 16-bit variable
 	clr a
 	mov Count1ms+0, a
@@ -203,6 +204,35 @@ Display_BCD_7_Seg:
 ; initialization and 'forever'    ;
 ; loop.                           ;
 ;---------------------------------;
+
+
+playSingle_beep: 
+setb TR0
+Wait_Milli_Seconds(#100)
+clr TR0
+clr ET0
+clr SOUND_OUT
+ret
+
+ten_beeps:
+mov R1, #10
+lcall Play_beeps
+ret
+
+five_beeps:
+mov R1, #5
+lcall Play_beeps
+ret
+
+Play_beeps:
+push AR1
+lcall playSingle_beep
+Wait_Milli_Seconds(#100)
+djnz R1, Play_beeps
+pop AR1
+ret 
+
+
 main:
 	; Initialization
     mov SP, #0x7F
@@ -227,10 +257,20 @@ main:
 	
 	; After initialization the program stays in this 'forever' loop
 loop:
+
+	
+	jnb Play_beeps_Switch, skip_beep
+	;lcall playSingle_beep
+
+
+skip_beep:
 	jb KEY.1, loop_a  ; if the KEY1 button is not pressed skip
 	Wait_Milli_Seconds(#50)	; Debounce delay.  This macro is also in 'LCD_4bit_DE1Lite.inc'
 	jb KEY.1, loop_a  ; if the KEY1 button is not pressed skip
 	jnb KEY.1, $		; Wait for button release.  The '$' means: jump to same instruction.
+	
+
+	
 	; A valid press of the 'BOOT' button has been detected, reset the BCD counter.
 	; But first stop timer 2 and reset the milli-seconds counter, to resync everything.
 	clr TR2 ; Stop timer 2
@@ -240,14 +280,15 @@ loop:
 	; Now clear the BCD counter
 	mov BCD_counter, a
 	setb TR2    ; Start timer 2
+
 	sjmp loop_b ; Display the new value
 loop_a:
-	jnb half_seconds_flag, loop
+	jnb half_seconds_flag, skip_beep
 loop_b:
     clr half_seconds_flag ; We clear this flag in the main loop, but it is set in the ISR for timer 2
 	Set_Cursor(1, 14)     ; the place in the LCD where we want the BCD counter value
 	Display_BCD(BCD_counter) ; This macro is also in 'LCD_4bit_DE1Lite.inc'
 	lcall Display_BCD_7_Seg ; Also display the counter using the 7-segment displays.
-    ljmp loop
+    ljmp skip_beep
 END
 
