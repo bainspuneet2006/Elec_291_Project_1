@@ -54,7 +54,8 @@ org 0x002B
 dseg at 0x30
 Count1ms:     ds 2 ; Used to determine when half second has passed
 BCD_counter:  ds 1 ; The BCD counter incrememted in the ISR and displayed in the main loop
-
+beep_count: ds 1
+beep_state: ds 1
 ; In the 8051 we have variables that are 1-bit in size.  We can use the setb, clr, jb, and jnb
 ; instructions with these variables.  This is how you define a 1-bit variable:
 bseg
@@ -103,7 +104,7 @@ Timer0_ISR:
 	;clr TF0  ; According to the data sheet this is done for us already.
 	mov TH0, #high(TIMER0_RELOAD) ; Timer 0 doesn't have autoreload in the CV-8052
 	mov TL0, #low(TIMER0_RELOAD)
-	;cpl SOUND_OUT ; Connect speaker to P3.7!
+	cpl SOUND_OUT ; Connect speaker to P3.7!
 	reti
 
 ;---------------------------------;
@@ -131,7 +132,7 @@ Timer2_Init:
 ;---------------------------------;
 Timer2_ISR:
 	clr TF2  ; Timer 2 doesn't clear TF2 automatically. Do it in ISR
-	cpl P1.1 ; To check the interrupt rate with oscilloscope. It must be precisely a 1 ms pulse.
+	;cpl P1.1  To check the interrupt rate with oscilloscope. It must be precisely a 1 ms pulse.
 	
 	; The two registers used in the ISR must be saved in the stack
 	push acc
@@ -142,6 +143,7 @@ Timer2_ISR:
 	mov a, Count1ms+0 ; If the low 8-bits overflow, then increment high 8-bits
 	jnz Inc_Done
 	inc Count1ms+1
+	
 
 Inc_Done:
 	; Check if half second has passed
@@ -154,6 +156,26 @@ Inc_Done:
 	setb half_seconds_flag ; Let the main program know half second had passed
 	; Toggle LEDR0 so it blinks
 	cpl LEDRA.0
+	
+	
+	mov a, beep_count
+	jz no_beep
+	
+	
+	mov a, beep_state
+	jz turn_beep_on
+	
+	clr TR0
+	clr SOUND_OUT
+	mov beep_state, #0
+	dec beep_count
+	sjmp no_beep
+	
+	turn_beep_on:
+	setb TR0
+	mov beep_state, #1
+	
+	no_beep:
 	;cpl TR0 ; Enable/disable timer/counter 0. This line creates a beep-silence-beep-silence sound.
 	; Reset to zero the milli-seconds counter, it is a 16-bit variable
 	clr a
@@ -207,30 +229,17 @@ Display_BCD_7_Seg:
 
 
 playSingle_beep: 
-setb TR0
-Wait_Milli_Seconds(#100)
-clr TR0
-clr ET0
-clr SOUND_OUT
+mov beep_count, #1
 ret
 
 ten_beeps:
-mov R1, #10
-lcall Play_beeps
+mov beep_count, #10
 ret
 
 five_beeps:
-mov R1, #5
-lcall Play_beeps
+mov beep_count, #5
 ret
 
-Play_beeps:
-push AR1
-lcall playSingle_beep
-Wait_Milli_Seconds(#100)
-djnz R1, Play_beeps
-pop AR1
-ret 
 
 
 main:
@@ -254,13 +263,16 @@ main:
     Send_Constant_String(#Initial_Message)
     setb half_seconds_flag
 	mov BCD_counter, #0x00 ; Initialize counter to zero
+	clr TR0
+	clr SOUND_OUT
 	
 	; After initialization the program stays in this 'forever' loop
 loop:
 
 	
 	jnb Play_beeps_Switch, skip_beep
-	;lcall playSingle_beep
+	jnb half_seconds_flag, skip_beep   ; wait for 500 ms tick
+	lcall playSingle_beep
 
 
 skip_beep:
@@ -283,12 +295,12 @@ skip_beep:
 
 	sjmp loop_b ; Display the new value
 loop_a:
-	jnb half_seconds_flag, skip_beep
+	jnb half_seconds_flag, loop
 loop_b:
     clr half_seconds_flag ; We clear this flag in the main loop, but it is set in the ISR for timer 2
 	Set_Cursor(1, 14)     ; the place in the LCD where we want the BCD counter value
 	Display_BCD(BCD_counter) ; This macro is also in 'LCD_4bit_DE1Lite.inc'
 	lcall Display_BCD_7_Seg ; Also display the counter using the 7-segment displays.
-    ljmp skip_beep
+    ljmp loop
 END
 
