@@ -1,5 +1,6 @@
 ; NOTE: ADD THIS CODE AFTER T_7seg in the main project code
 ; NOTE: In the main project code where it says Set_Cursor(1,14), replace lcall Display_BCD_7_Seg with lcall Display_TempC_7seg
+; NOTE: add lcall Display_TempC_7seg after lcall Read_Ref, lcall Read_op_amp_mv, lcall VoutmV_To_TempC
 
 
 ; =======================================================
