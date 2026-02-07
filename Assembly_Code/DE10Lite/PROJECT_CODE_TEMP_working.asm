@@ -80,6 +80,8 @@ org 0x002B
 ; In the 8051 we can define direct access variables starting at location 0x30 up to location 0x7F
 dseg at 0x30
 Count1ms:     ds 2 ; Used to determine when half second has passed
+count_ms:     ds 2 ; For determining when a full second has passed
+
 BCD_counter:  ds 1 ; The BCD counter incrememted in the ISR and displayed in the main loop
 beep_count: ds 1
 beep_state: ds 1
@@ -90,7 +92,8 @@ Temp_refl: ds 1
 Time_refl: ds 1
 pwm_counter: ds 1
 pwm: ds 1
-
+temp: ds 1 
+sec: ds 1
 x : ds 4
 y : ds 4
 bcd : ds 5
@@ -208,16 +211,29 @@ Timer2_ISR:
 	jnz Inc_Done
 	inc Count1ms+1
 
+	inc count_ms+0
+	mov a, count_ms+0
+	jnz Inc_Done
+	inc count_ms+1
 Inc_Done:
 	; Check if half second has passed
 	mov a, Count1ms+0
 	cjne a, #low(500), Timer2_ISR_done ; Warning: this instruction changes the carry flag!
 	mov a, Count1ms+1
 	cjne a, #high(500), Timer2_ISR_done
-
 	
 	
 	clr a
+	
+	mov a, count_ms+0
+	cjne a, #low(1000), check_pwm_val
+	mov a, count_ms+1
+	cjne a, #high(1000), check_pwm_val
+	
+	inc sec
+	clr a
+	mov count_ms+0, a
+	mov count_ms+1, a
 	
 	mov Count1ms+0, a
 	mov Count1ms+1, a
@@ -342,6 +358,8 @@ FSM1_state1:
 	subb a, temp
 	jnc FSM1_state1_done
 	mov FSM1_state, #2
+	;play beep on state switch
+	lcall playSingle_beep
 	
 FSM1_state1_done:
 
@@ -354,13 +372,62 @@ FSM1_state2:
 	mov a, time_soak
 	clr c
 	; ------------clarify if this is where we store the time passed-----;
+	; yes it is i defined it --
 	subb a, sec
 	jnc FSM1_state2_done
 	mov FSM1_state, #3
+	;state switch
+	lcall playSingle_beep
 	
 FSM1_state2_done:
 
 	ljmp FSM2
+	
+	
+FSM1_state3:
+	cjne a, #3, FSM1_state4
+	mov pwm, #100
+	mov sec, #0
+	mov a, temp_refl
+	clr c
+	subb a, temp
+	jnc FSM1_state3_done
+	mov FSM1_state, #4
+	lcall playSingle_beep
+	
+FSM1_state3_done:
+	ljmp FSM2
+	
+FSM1_state4:
+	cjne a, #4, FSM1_state5
+	mov pwm, #20
+	mov a, time_refl
+	clr c
+	subb a, sec
+	jnc FSM1_state4_done
+	mov FSM1_state, #5
+	
+	lcall playSingle_beep
+	
+FSM1_state4_done:
+ljmp FSM2
+
+
+FSM1_state5:
+	cjne a, #5, FSM1_state0
+	mov pwm, #0
+	mov a, temp
+	clr c
+	subb a, #60
+	
+	
+	jnc FSM_state5_done
+	mov FSM1_state, #0
+	
+FSM_state5_done: 
+ljmp FSM2
+	
+	
 
 
 
@@ -676,6 +743,7 @@ send_temp_serial:
     ; x = x / 100  -> integer degrees C
     Load_y(100)
     lcall div32          ; x now = integer °C (0..300-ish)
+    mov temp, x+0
 
     ; --- print as exactly 3 digits: H T O ---
     ; R3:R4 = x (16-bit is enough here)
