@@ -435,7 +435,7 @@ ljmp FSM2
 
 
 FSM1_state5:
-	cjne a, #5, FSM1_state0
+	cjne a, #5, FSM1_state6
 	mov pwm, #0
 	mov a, temp
 	clr c
