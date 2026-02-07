@@ -454,7 +454,7 @@ FSM1_state6:
 
     ; Stay here until the START switch is released (Start_Switch = 1)
     ; (Your Start_Switch appears active-low because state0 uses "jb Start_Switch")
-    jb Start_Switch, _err_to_idle
+    jb Start_Switch, FSM_state6_done
     ljmp FSM2                  ; keep waiting
 
 FSM_state6_done:
