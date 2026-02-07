@@ -112,6 +112,7 @@ VAL_LM4040: ds 2
 bseg
 half_seconds_flag: dbit 1 ; Set to one in the ISR every time 500 ms had passed
 mf : dbit 1
+Reached50_flag: dbit 1     ; NEW: set once temperature >= 50C during first 60s
 
 cseg
 ; These 'equ' must match the wiring between the DE10Lite board and the LCD!
@@ -332,6 +333,8 @@ FSM_state0:
 	jb Start_Switch, FSM1_state0_done
 	;jnb PB6, $
 	lcall playSingle_beep
+	mov sec, #0            ; start timing "first 60 seconds"
+    clr Reached50_flag
 	mov FSM1_state, #1
 	
 	
@@ -344,19 +347,44 @@ FSM1_state0_done:
 FSM1_state1:
 	cjne a, #1, FSM1_state2
 	mov pwm, #100
-	mov sec, #0
-	mov a, temp_soak
-	clr c
-	;--------clarify if temp is where we store temperature;
-	subb a, temp
-	jnc FSM1_state1_done
-	mov FSM1_state, #2
-	;play beep on state switch
-	lcall playSingle_beep
+
+; -------------------------------
+    ; SAFETY ABORT (Lab requirement):
+    ; Abort if NOT >=50C within 60s
+    ; -------------------------------
+
+    ; If temp >= 50C, latch the flag
+    mov a, temp
+    clr c
+    subb a, #50
+    jc  temp_below_50
+    setb Reached50_flag
+
+temp_below_50:
+    ; If sec >= 60 and we never reached 50C -> ERROR
+    mov a, sec
+    clr c
+    subb a, #60
+    jc  continue_preheat          ; sec < 60, keep going
+    jb  Reached50_flag, continue_preheat
+
+    ; ---- ABORT ----
+    mov pwm, #0
+    mov FSM1_state, #6             ; ERROR state (new)
+    lcall ten_beeps                ; required error beeps
+    ljmp FSM2
+
+continue_preheat:
+    ; -------- existing logic to go to SOAK when temp reaches temp_soak -----
+    mov a, temp_soak
+    clr c
+    subb a, temp
+    jnc FSM1_state1_done
+    mov FSM1_state, #2
+    lcall playSingle_beep
 	
 FSM1_state1_done:
-
-
+	
 	ljmp FSM2
 	
 FSM1_state2:
@@ -419,13 +447,22 @@ FSM1_state5:
 	
 FSM_state5_done: 
 ljmp FSM2
+
+FSM1_state6:
+    cjne a, #6, FSM_state0     ; if not error, go back to normal dispatcher
+    mov pwm, #0                ; force oven OFF
+
+    ; Stay here until the START switch is released (Start_Switch = 1)
+    ; (Your Start_Switch appears active-low because state0 uses "jb Start_Switch")
+    jb Start_Switch, _err_to_idle
+    ljmp FSM2                  ; keep waiting
+
+FSM_state6_done:
+    mov FSM1_state, #0          ; return to idle
+    ljmp FSM2
+
 	
 	
-
-
-
-
-
 ; -------Other FSM states can go here-------
 
 ;---------------------------------;
@@ -526,9 +563,9 @@ loop_b:
 
 ; =======================================================
 ; Display_TempC_7Seg
-; Displays temperature (integer 캜) on HEX2 HEX1 HEX0
+; Displays temperature (integer 째C) on HEX2 HEX1 HEX0
 ; Uses:
-;   t_hot  = centi-캜 (캜*100)  [already computed in VoutmV_To_TempC]
+;   t_hot  = centi-째C (째C*100)  [already computed in VoutmV_To_TempC]
 ;   math32 div32 (x = x/y)
 ; Reuses T_7seg table (0..9)
 ; =======================================================
@@ -538,15 +575,15 @@ Display_TempC_7Seg:
     push dpl
     push dph
 
-    ; x = t_hot (centi-캜)
+    ; x = t_hot (centi-째C)
     mov x+0, t_hot+0
     mov x+1, t_hot+1
     mov x+2, t_hot+2
     mov x+3, t_hot+3
 
-    ; x = x / 100  -> integer 캜
+    ; x = x / 100  -> integer 째C
     Load_y(100)
-    lcall div32              ; x now = integer 캜
+    lcall div32              ; x now = integer 째C
 
     ; Copy integer temp to R3:R4 (16-bit is enough)
     mov R4, x+0
@@ -735,7 +772,7 @@ send_temp_serial:
 
     ; x = x / 100  -> integer degrees C
     Load_y(100)
-    lcall div32          ; x now = integer 캜 (0..300-ish)
+    lcall div32          ; x now = integer 째C (0..300-ish)
     mov temp, x+0
 
     ; --- print as exactly 3 digits: H T O ---
@@ -871,9 +908,9 @@ _ref_ok:
 ; Steps:
 ; 1) uV_opamp = mV * 1000
 ; 2) uV_tc    = uV_opamp / GAIN (300)
-; 3) Temp_cC  = uV_tc * 100 / 41    (41 uV per 1캜)
-; 4) add T_cold (centi-캜)
-; Output: t_hot = total temp in centi-캜 (캜*100)
+; 3) Temp_cC  = uV_tc * 100 / 41    (41 uV per 1째C)
+; 4) add T_cold (centi-째C)
+; Output: t_hot = total temp in centi-째C (째C*100)
 ;---------------------------------
 VoutmV_To_TempC:
     ; x = V_amp_mv (mV)
@@ -899,9 +936,9 @@ VoutmV_To_TempC:
     lcall mul32
 
     Load_y(41)
-    lcall div32          ; x now = temp in centi-캜 from thermocouple only
+    lcall div32          ; x now = temp in centi-째C from thermocouple only
 
-    ; add cold junction temp (centi-캜)
+    ; add cold junction temp (centi-째C)
     mov A, T_cold+0
     mov y+0, A
     mov A, T_cold+1
@@ -916,7 +953,7 @@ VoutmV_To_TempC:
 
     lcall add32          ; x = x + y
 
-    ; store into t_hot (centi-캜)
+    ; store into t_hot (centi-째C)
     mov A, x+0
     mov t_hot+0, A
     mov A, x+1
