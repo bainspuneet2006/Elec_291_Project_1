@@ -1,0 +1,922 @@
+0000              1   ; ISR_example_DE10Lite.asm:
+0000              2   ; a) Increments/decrements a BCD variable every half second using
+0000              3   ;    an ISR for timer 2.  Uses SW0 to decide.  Also 'blinks' LEDR0 every
+0000              4   ;    half second.
+0000              5   ; b) Generates a 2kHz square wave at pin P1.5 using an ISR for timer 0.
+0000              6   ; c) In the 'main' loop it displays the variable incremented/decremented
+0000              7   ;    using the ISR for timer 2 on the LCD and the 7-segment displays.
+0000              8   ;    Also resets it to zero if the KEY1 pushbutton  is pressed.
+0000              9   ; d) Controls the LCD using general purpose pins P2.3, P2.5, P2.7, P3.1, P3.3, P3.5, P3.7
+0000             10   ;
+0000             11   ; FIXES ADDED:
+0000             12   ;   1) Stack pointer moved off 0x7F -> 0x60 (0x7F causes pushes into SFR space at 0x80+)
+0000             13   ;   2) Removed cpl P1.1 inside Timer2 ISR (P1.1 is LCD E pin, was being toggled every 1ms)
+0000             14   ;   3) Timer2 ISR now saves/restores B, DPL, DPH too (prevents random corruption w/ math/LCD)
+0000             15   ;   4) Serial: setb TI after init, and a more standard putchar (wait TI, clr TI, write SBUF)
+0000             16   ;
+                 18   $LIST
+0000             20   
+0000             21   
+0000             22   CLK           EQU 33333333 ; Microcontroller system crystal frequency in Hz
+0000             23   TIMER0_RATE   EQU 4096     ; 2048Hz squarewave (peak amplitude of CEM-1203 speaker)
+0000             24   TIMER0_RELOAD EQU ((65536-(CLK/(12*TIMER0_RATE)))) ; The prescaler in the CV-8052 is always 12 unlike the N76E003 where is selectable.
+0000             25   TIMER2_RATE   EQU 1000     ; 1000Hz, for a timer tick of 1ms
+0000             26   TIMER2_RELOAD EQU ((65536-(CLK/(12*TIMER2_RATE))))
+0000             27   
+0000             28   SOUND_OUT     equ P1.5
+0000             29   UPDOWN        equ SWA.0
+0000             30   Play_beeps_Switch equ SWA.1
+0000             31   
+0000             32   ; Unfortunately the maximum baurate we can use with timer 1 is 57600
+0000             33   ; so make sure you configure putty/matlab/python accordingly.
+0000             34   BAUD            EQU 57600
+0000             35   TIMER_1_RELOAD  EQU (256-((2*CLK)/(12*32*BAUD)))
+0000             36   
+0000             37   ; The Special Function Registers below were added to 'MODMAX10' recently.
+0000             38   ; If you are getting an error, uncomment the three lines below.
+0000             39   
+0000             40   ;ADC_C DATA 0A1h
+0000             41   ;ADC_L DATA 0A2h
+0000             42   ;ADC_H DATA 0A3h
+0000             43   
+0000             44   ; Reset vector
+0000             45   org 0x0000
+0000 02041F      46       ljmp main
+0003             47   
+0003             48   ; External interrupt 0 vector (not used in this code)
+0003             49   org 0x0003
+0003 32          50            reti
+0004             51   
+0004             52   ; Timer/Counter 0 overflow interrupt vector
+000B             53   org 0x000B
+000B 02038C      54            ljmp Timer0_ISR
+000E             55   
+000E             56   ; External interrupt 1 vector (not used in this code)
+0013             57   org 0x0013
+0013 32          58            reti
+0014             59   
+0014             60   ; Timer/Counter 1 overflow interrupt vector (not used in this code)
+001B             61   org 0x001B
+001B 32          62            reti
+001C             63   
+001C             64   ; Serial port receive/transmit interrupt vector (not used in this code)
+0023             65   org 0x0023
+0023 32          66            reti
+0024             67   
+0024             68   ; Timer/Counter 2 overflow interrupt vector
+002B             69   org 0x002B
+002B 0203AE      70            ljmp Timer2_ISR
+002E             71   
+002E             72   
+002E             73   ; In the 8051 we can define direct access variables starting at location 0x30 up to location 0x7F
+0030             74   dseg at 0x30
+0030             75   Count1ms:     ds 2 ; Used to determine when half second has passed
+0032             76   BCD_counter:  ds 1 ; The BCD counter incrememted in the ISR and displayed in the main loop
+0033             77   beep_count: ds 1
+0034             78   beep_state: ds 1
+0035             79   x : ds 4
+0039             80   y : ds 4
+003D             81   bcd : ds 5
+0042             82   
+0042             83   V_amp_mv: ds 4
+0046             84   V_unamp: ds 4
+004A             85   T_cold: ds 4
+004E             86   t_hot : ds 4
+0052             87   VAL_LM4040: ds 2
+0054             88   
+0054             89   
+0054             90   ; In the 8051 we have variables that are 1-bit in size.  We can use the setb, clr, jb, and jnb
+0054             91   ; instructions with these variables.  This is how you define a 1-bit variable:
+0000             92   bseg
+0000             93   half_seconds_flag: dbit 1 ; Set to one in the ISR every time 500 ms had passed
+0001             94   mf : dbit 1
+0002             95   
+002E             96   cseg
+002E             97   ; These 'equ' must match the wiring between the DE10Lite board and the LCD!
+002E             98   ; P0 is in connector JPIO.  Check "CV-8052 Soft Processor in the DE10Lite Board: Getting
+002E             99   ; Started Guide" for the details.
+002E            100   ELCD_RS equ P1.7
+002E            101   ; ELCD_RW equ Px.x ; Not used.  Connected to ground
+002E            102   ELCD_E  equ P1.1
+002E            103   ELCD_D4 equ P0.7
+002E            104   ELCD_D5 equ P0.5
+002E            105   ELCD_D6 equ P0.3
+002E            106   ELCD_D7 equ P0.1
+002E            107   
+002E 0D0A4865   108   InitialString: db '\r\nHello, World!\r\n', 0
+     6C6C6F2C
+     20576F72
+     6C64210D
+     0A00
+                546   $LIST
+                111   $LIST
+0367            113   
+0367            114   
+0367            115   ;                     1234567890123456    <- This helps determine the location of the counter
+0367 54656D70   116   Initial_Message:  db 'TempC= xx ', 0
+     433D2078
+     782000
+0372            117   
+0372            118   ; Optional: label for serial output
+0372 54656D70   119   TempLabel: db 'TempC=',0
+     433D00
+0379            120   
+0379            121   
+0379            122   ;---------------------------------;
+0379            123   ; Routine to initialize the ISR   ;
+0379            124   ; for timer 0                     ;
+0379            125   ;---------------------------------;
+0379            126   Timer0_Init:
+0379 E589       127            mov a, TMOD
+037B 54F0       128            anl a, #0xf0 ; Clear the bits for timer 0
+037D 4401       129            orl a, #0x01 ; Configure timer 0 as 16-timer
+037F F589       130            mov TMOD, a
+0381 758CFD     131            mov TH0, #high(TIMER0_RELOAD)
+0384 758A5A     132            mov TL0, #low(TIMER0_RELOAD)
+0387            133            ; Enable the timer and interrupts
+0387 D2A9       134       setb ET0  ; Enable timer 0 interrupt
+0389 C28C       135       clr TR0  ; Start timer 0
+038B 22         136            ret
+038C            137   
+038C            138   ;---------------------------------;
+038C            139   ; ISR for timer 0.  Set to execute;
+038C            140   ; every 1/4096Hz to generate a    ;
+038C            141   ; 2048 Hz square wave at pin P3.7 ;
+038C            142   ;---------------------------------;
+038C            143   Timer0_ISR:
+038C            144            ;clr TF0  ; According to the data sheet this is done for us already.
+038C 758CFD     145            mov TH0, #high(TIMER0_RELOAD) ; Timer 0 doesn't have autoreload in the CV-8052
+038F 758A5A     146            mov TL0, #low(TIMER0_RELOAD)
+0392 B295       147            cpl SOUND_OUT ; Connect speaker to P3.7!
+0394 32         148            reti
+0395            149   
+0395            150   
+0395            151   ;---------------------------------;
+0395            152   ; Routine to initialize the ISR   ;
+0395            153   ; for timer 2                     ;
+0395            154   ;---------------------------------;
+0395            155   Timer2_Init:
+0395 75C800     156            mov T2CON, #0 ; Stop timer/counter.  Autoreload mode.
+0398 75CDF5     157            mov TH2, #high(TIMER2_RELOAD)
+039B 75CC27     158            mov TL2, #low(TIMER2_RELOAD)
+039E            159            ; Set the reload value
+039E 75CBF5     160            mov RCAP2H, #high(TIMER2_RELOAD)
+03A1 75CA27     161            mov RCAP2L, #low(TIMER2_RELOAD)
+03A4            162            ; Init One millisecond interrupt counter.  It is a 16-bit variable made with two 8-bit parts
+03A4 E4         163            clr a
+03A5 F530       164            mov Count1ms+0, a
+03A7 F531       165            mov Count1ms+1, a
+03A9            166            ; Enable the timer and interrupts
+03A9 D2AD       167       setb ET2  ; Enable timer 2 interrupt
+03AB D2CA       168       setb TR2  ; Enable timer 2
+03AD 22         169            ret
+03AE            170   
+03AE            171   
+03AE            172   ;---------------------------------;
+03AE            173   ; ISR for timer 2                 ;
+03AE            174   ;---------------------------------;
+03AE            175   Timer2_ISR:
+03AE C2CF       176            clr TF2  ; Timer 2 doesn't clear TF2 automatically. Do it in ISR
+03B0            177   
+03B0            178       ; FIX: DO NOT toggle P1.1 here. P1.1 is LCD E pin (ELCD_E equ P1.1)
+03B0            179       ; cpl P1.1 ; <-- REMOVED
+03B0            180   
+03B0            181            ; Save registers used (stronger save to avoid corruption w/ LCD + math32)
+03B0 C0E0       182            push acc
+03B2 C0D0       183            push psw
+03B4 C0F0       184       push b
+03B6 C082       185       push dpl
+03B8 C083       186       push dph
+03BA            187   
+03BA            188            ; Increment the 16-bit one mili second counter
+03BA 0530       189            inc Count1ms+0    ; Increment the low 8-bits first
+03BC E530       190            mov a, Count1ms+0 ; If the low 8-bits overflow, then increment high 8-bits
+03BE 7002       191            jnz Inc_Done
+03C0 0531       192            inc Count1ms+1
+03C2            193   
+03C2            194   Inc_Done:
+03C2            195            ; Check if half second has passed
+03C2 E530       196            mov a, Count1ms+0
+03C4 B4F43D     197            cjne a, #low(500), Timer2_ISR_done ; Warning: this instruction changes the carry flag!
+03C7 E531       198            mov a, Count1ms+1
+03C9 B40138     199            cjne a, #high(500), Timer2_ISR_done
+03CC            200   
+03CC            201            
+03CC            202            
+03CC E4         203            clr a
+03CD            204            
+03CD F530       205            mov Count1ms+0, a
+03CF F531       206            mov Count1ms+1, a
+03D1            207            ; 500 milliseconds have passed.  Set a flag so the main program knows
+03D1 D200       208            setb half_seconds_flag ; Let the main program know half second had passed
+03D3            209            ; Toggle LEDR0 so it blinks
+03D3 B2E8       210            cpl LEDRA.0
+03D5            211            
+03D5 E533       212            mov a, beep_count
+03D7 6016       213            jz stop_beeping
+03D9            214            
+03D9 E534       215            mov a, beep_state
+03DB 600B       216            jz turn_beep_on
+03DD            217            
+03DD C28C       218            clr TR0 ; Enable/disable timer/counter 0. This line creates a beep-silence-beep-silence sound.
+03DF            219            ; Reset to zero the milli-seconds counter, it is a 16-bit variable
+03DF C295       220            clr SOUND_OUT
+03E1 753400     221            mov beep_state, #0
+03E4 1533       222            dec beep_count
+03E6 800E       223            sjmp beep_done
+03E8            224            
+03E8            225            
+03E8            226            turn_beep_on:
+03E8 D28C       227            setb TR0
+03EA 753401     228            mov beep_state, #1
+03ED 8007       229            sjmp beep_done
+03EF            230            
+03EF            231            
+03EF            232   stop_beeping: 
+03EF C28C       233   clr TR0
+03F1 C295       234   clr SOUND_OUT
+03F3 753400     235   mov beep_state, #0
+03F6            236   
+03F6            237            
+03F6            238            beep_done:
+03F6            239            
+03F6            240            ; Increment the BCD counter
+03F6 E532       241            mov a, BCD_counter
+03F8 20E804     242            jb UPDOWN, Timer2_ISR_decrement
+03FB 2401       243            add a, #0x01
+03FD 8002       244            sjmp Timer2_ISR_da
+03FF            245            
+03FF            246   Timer2_ISR_decrement:
+03FF 2499       247            add a, #0x99 ; Adding the 10-complement of -1 is like subtracting 1.
+0401            248   Timer2_ISR_da:
+0401 D4         249            da a ; Decimal adjust instruction.  Check datasheet for more details!
+0402 F532       250            mov BCD_counter, a
+0404            251   
+0404            252   Timer2_ISR_done:
+0404 D083       253       pop dph
+0406 D082       254       pop dpl
+0408 D0F0       255       pop b
+040A D0D0       256            pop psw
+040C D0E0       257            pop acc
+040E 32         258            reti
+040F            259   
+040F            260   
+040F            261   ; Look-up table for the 7-seg displays. (Segments are turn on with zero)
+040F            262   T_7seg:
+040F C0F9A4B0   263       DB 0xC0, 0xF9, 0xA4, 0xB0, 0x99        ; 0 TO 4
+     99
+0414 9282F880   264       DB 0x92, 0x82, 0xF8, 0x80, 0x90        ; 4 TO 9
+     90
+0419 8883C6A1   265       DB 0x88, 0x83, 0xC6, 0xA1, 0x86, 0x8E  ; A to F
+     868E
+041F            266   
+041F            267   
+041F            268   
+041F            269   ;---------------------------------;
+041F            270   ; Main program. Includes hardware ;
+041F            271   ; initialization and 'forever'    ;
+041F            272   ; loop.                           ;
+041F            273   ;---------------------------------;
+041F            274   main:
+041F            275            ; Initialization
+041F            276       ; FIX: SP MUST NOT BE 0x7F for this big program (interrupts + LCD + math).
+041F            277       ; Put stack above your variables but still below 0x7F.
+041F 758160     278       mov SP, #0x60
+0422            279   
+0422 120379     280       lcall Timer0_Init
+0425 120395     281       lcall Timer2_Init
+0428 120535     282            lcall Initialize_Serial_Port
+042B            283   
+042B            284       ; We use the pins of P0 to control the LCD.  Configure as outputs.
+042B 759AAA     285       mov P0MOD, #10101010b ; P0.1, P0.3, P0.5, P0.7 are outputs.  ('1' makes the pin output)
+042E            286       ; We use pins P1.5 and P1.1 as outputs also.  Configure accordingly.
+042E 759BA2     287       mov P1MOD, #10100010b ; P1.7 and P1.1 are outputs
+0431 759CFF     288       mov P2MOD, #0xff
+0434 759DFF     289       mov P3MOD, #0xff
+0437            290   
+0437            291       ; Turn off all the LEDs
+0437 75E800     292       mov LEDRA, #0 ; LEDRA is bit addressable
+043A 759500     293       mov LEDRB, #0 ; LEDRB is NOT bit addresable
+043D            294   
+043D D2AF       295       setb EA   ; Enable Global interrupts
+043F            296   
+043F 12009C     297       lcall ELCD_4BIT ; Configure LCD in four bit mode
+0442            298   
+0442            299       ; For convenience a few handy macros are included in 'LCD_4bit_DE1Lite.inc':
+0442 C0E0       300            push acc
+0444 7401       300            mov a, #1
+0446 14         300            dec a
+0447 1200DC     300            lcall ?Set_Cursor_1 ; Select column and row
+044A D0E0       300            pop acc
+044C C083       301            push dph
+044E C082       301            push dpl
+0450 C0E0       301            push acc
+0452 900367     301            mov dptr, #Initial_Message
+0455 1200CF     301            lcall ?Send_Constant_String
+0458 D0E0       301            pop acc
+045A D082       301            pop dpl
+045C D083       301            pop dph
+045E D200       302       setb half_seconds_flag
+0460 753200     303            mov BCD_counter, #0x00 ; Initialize counter to zero
+0463            304   
+0463 754A98     305       mov T_cold+0, #098h   ; 2200 low byte
+0466 754B08     306       mov T_cold+1, #008h   ; 2200 high byte
+0469 754C00     307       mov T_cold+2, #000h
+046C 754D00     308       mov T_cold+3, #000h
+046F 75A180     309            mov ADC_C, #080h ; Reset ADC
+0472 C002       310            push AR2
+0474 7A32       310            mov R2, #50
+0476 12004D     310            lcall ?Wait_Milli_Seconds
+0479 D002       310            pop AR2
+047B            311   
+047B            312            ; After initialization the program stays in this 'forever' loop
+047B            313   loop:
+047B            314   
+047B            315   
+047B            316   ;testing to playbeeps when switch is on. Replace this in fsm. call functions for 1, 5 or 10 beeps 
+047B 30E906     317   jnb Play_beeps_Switch, skip_beep
+047E 300003     318   jnb half_seconds_flag, skip_beep
+0481 120571     319   lcall playSingle_beep
+0484            320   
+0484            321   skip_beep:
+0484 20F91C     322            jb KEY.1, loop_a  ; if the KEY1 button is not pressed skip
+0487 C002       323            push AR2
+0489 7A32       323            mov R2, #50
+048B 12004D     323            lcall ?Wait_Milli_Seconds
+048E D002       323            pop AR2         ; Debounce delay.  This macro is also in 'LCD_4bit_DE1Lite.inc'
+0490 20F910     324            jb KEY.1, loop_a  ; if the KEY1 button is not pressed skip
+0493 30F9FD     325            jnb KEY.1, $            ; Wait for button release.  The '$' means: jump to same instruction.
+0496            326            ; A valid press of the 'BOOT' button has been detected, reset the BCD counter.
+0496            327            ; But first stop timer 2 and reset the milli-seconds counter, to resync everything.
+0496 C2CA       328            clr TR2 ; Stop timer 2
+0498 E4         329            clr a
+0499            330   
+0499 F530       331            mov Count1ms+0, a
+049B F531       332            mov Count1ms+1, a
+049D            333            ; Now clear the BCD counter
+049D F532       334            mov BCD_counter, a
+049F D2CA       335            setb TR2    ; Start timer 2
+04A1 8003       336            sjmp loop_b ; Display the new value
+04A3            337   loop_a:
+04A3 3000D5     338            jnb half_seconds_flag, loop
+04A6            339   loop_b:
+04A6 C200       340       clr half_seconds_flag ; We clear this flag in the main loop, but it is set in the ISR for timer 2
+04A8            341   
+04A8            342                ; the place in the LCD where we want the BCD counter value
+04A8            343            ; Also display the counter using the 7-segment displays.
+04A8            344   
+04A8 120606     345            lcall Read_Ref
+04AB 120610     346            lcall Read_op_amp_mv
+04AE            347            ;lcall PrintHex32_Vamp
+04AE            348            ;lcall send_adc_debug
+04AE 12065D     349            lcall VoutmV_To_TempC
+04B1 C0E0       350            push acc
+04B3 7407       350            mov a, #7
+04B5 14         350            dec a
+04B6 1200DC     350            lcall ?Set_Cursor_1 ; Select column and row
+04B9 D0E0       350            pop acc
+04BB 1204C4     351            lcall Display_TempC_7seg
+04BE            352            ;mov t_cold, #0x01
+04BE            353            ;mov t_hot, #0xff
+04BE            354            ; now we need to print the temp to hex display and send it to the serial monitor
+04BE 1205A7     355            lcall send_temp_serial
+04C1            356            
+04C1            357   
+04C1 02047B     358       ljmp loop
+04C4            359   
+04C4            360   
+04C4            361   ;SUBROUTINES HERE
+04C4            362   
+04C4            363   ; =======================================================
+04C4            364   ; Display_TempC_7Seg
+04C4            365   ; Displays temperature (integer °C) on HEX2 HEX1 HEX0
+04C4            366   ; Uses:
+04C4            367   ;   t_hot  = centi-°C (°C*100)  [already computed in VoutmV_To_TempC]
+04C4            368   ;   math32 div32 (x = x/y)
+04C4            369   ; Reuses T_7seg table (0..9)
+04C4            370   ; =======================================================
+04C4            371   Display_TempC_7Seg:
+04C4 C0E0       372       push acc
+04C6 C0F0       373       push b
+04C8 C082       374       push dpl
+04CA C083       375       push dph
+04CC            376   
+04CC            377       ; x = t_hot (centi-°C)
+04CC 854E35     378       mov x+0, t_hot+0
+04CF 854F36     379       mov x+1, t_hot+1
+04D2 855037     380       mov x+2, t_hot+2
+04D5 855138     381       mov x+3, t_hot+3
+04D8            382   
+04D8            383       ; x = x / 100  -> integer °C
+04D8 753964     384            mov y+0, #low (100 % 0x10000) 
+04DB 753A00     384            mov y+1, #high(100 % 0x10000) 
+04DE 753B00     384            mov y+2, #low (100 / 0x10000) 
+04E1 753C00     384            mov y+3, #high(100 / 0x10000) 
+04E4 1202FE     385       lcall div32              ; x now = integer °C
+04E7            386   
+04E7            387       ; Copy integer temp to R3:R4 (16-bit is enough)
+04E7 AC35       388       mov R4, x+0
+04E9 AB36       389       mov R3, x+1
+04EB            390   
+04EB            391       ; -------------------------
+04EB            392       ; Compute hundreds in R2
+04EB            393       ; -------------------------
+04EB 7A00       394       mov R2, #0               ; hundreds
+04ED            395   
+04ED            396   DT_Hund_Loop:
+04ED            397       ; if (R3:R4) < 100 stop
+04ED EB         398       mov a, R3
+04EE 7006       399       jnz DT_Hund_Sub
+04F0 EC         400       mov a, R4
+04F1 C3         401       clr c
+04F2 9464       402       subb a, #100
+04F4 400C       403       jc  DT_Hund_Done
+04F6            404   
+04F6            405   DT_Hund_Sub:
+04F6            406       ; (R3:R4) -= 100
+04F6 EC         407       mov a, R4
+04F7 C3         408       clr c
+04F8 9464       409       subb a, #100
+04FA FC         410       mov R4, a
+04FB EB         411       mov a, R3
+04FC 9400       412       subb a, #0
+04FE FB         413       mov R3, a
+04FF 0A         414       inc R2
+0500 80EB       415       sjmp DT_Hund_Loop
+0502            416   
+0502            417   DT_Hund_Done:
+0502            418       ; Now R2 = hundreds (0..9), remaining value in R4 is 0..99
+0502            419   
+0502            420       ; tens/ones from remaining
+0502 EC         421       mov a, R4
+0503 75F00A     422       mov b, #10
+0506 84         423       div ab                   ; A=tens (0..9), B=ones (0..9)
+0507 F9         424       mov R1, A                ; tens
+0508 A8F0       425       mov R0, B                ; ones
+050A            426   
+050A            427       ; -------------------------
+050A            428       ; Map digits to 7-seg and write HEX2..HEX0
+050A            429       ; -------------------------
+050A 90040F     430       mov dptr, #T_7seg
+050D            431   
+050D            432       ; ones -> HEX0
+050D E8         433       mov a, R0
+050E 93         434       movc a, @a+dptr
+050F F591       435       mov HEX0, a
+0511            436   
+0511            437       ; tens -> HEX1 (blank if hundreds=0 and tens=0)
+0511 EA         438       mov a, R2
+0512 7008       439       jnz DT_Show_Tens
+0514 E9         440       mov a, R1
+0515 7005       441       jnz DT_Show_Tens
+0517 7592FF     442       mov HEX1, #0FFh
+051A 8004       443       sjmp DT_Do_Hund
+051C            444   
+051C            445   DT_Show_Tens:
+051C E9         446       mov a, R1
+051D 93         447       movc a, @a+dptr
+051E F592       448       mov HEX1, a
+0520            449   
+0520            450   DT_Do_Hund:
+0520            451       ; hundreds -> HEX2 (blank if 0)
+0520 EA         452       mov a, R2
+0521 7005       453       jnz DT_Show_Hund
+0523 7593FF     454       mov HEX2, #0FFh
+0526 8004       455       sjmp DT_Done
+0528            456   
+0528            457   DT_Show_Hund:
+0528 EA         458       mov a, R2
+0529 93         459       movc a, @a+dptr
+052A F593       460       mov HEX2, a
+052C            461   
+052C            462   DT_Done:
+052C D083       463       pop dph
+052E D082       464       pop dpl
+0530 D0F0       465       pop b
+0532 D0E0       466       pop acc
+0534 22         467       ret
+0535            468   ; Displays a BCD number in HEX1-HEX0
+0535            469   
+0535            470   
+0535            471   Initialize_Serial_Port:
+0535            472            ; Configure serial port and baud rate
+0535 C28E       473            clr TR1 ; Disable timer 1
+0537 53890F     474            anl TMOD, #0x0f ; Mask the bits for timer 1
+053A 438920     475            orl TMOD, #0x20 ; Set timer 1 in 8-bit auto reload mode
+053D 438780     476            orl PCON, #80H ; Set SMOD to 1
+0540 758DFD     477            mov TH1, #low(TIMER_1_RELOAD)
+0543 758BFD     478            mov TL1, #low(TIMER_1_RELOAD)
+0546 D28E       479            setb TR1 ; Enable timer 1
+0548 759852     480            mov SCON, #52H
+054B D299       481       setb TI  ; FIX: prime TX so first putchar doesn't stall
+054D 22         482            ret
+054E            483   
+054E            484   
+054E            485   ; -----------------------------
+054E            486   ; ADDED: UART TX helpers
+054E            487   ; -----------------------------
+054E            488   putchar:
+054E 3099FD     489       jnb TI, $
+0551 C299       490       clr TI
+0553 F599       491       mov SBUF, a
+0555 22         492       ret
+0556            493   
+0556            494   ; SendString:
+0556            495   SendString:
+0556 E4         496       clr a
+0557 93         497       movc a, @a+dptr
+0558 6006       498       jz SendString_done
+055A 12054E     499       lcall putchar
+055D A3         500       inc dptr
+055E 80F6       501       sjmp SendString
+0560            502   SendString_done:
+0560 22         503       ret
+0561            504   
+0561            505   
+0561            506   
+0561            507   
+0561            508   ;---------------------------------;
+0561            509   ; PrintU32: prints unsigned 32-bit ;
+0561            510   ; integer in x as decimal over UART;
+0561            511   ; Uses div32 (math32.inc): quotient in x, remainder in y
+0561            512   ;---------------------------------;
+0561            513   
+0561            514   
+0561            515   PrintU32:
+0561            516       ; if x == 0 -> print '0'
+0561 E535       517       mov a, x+0
+0563 4536       518       orl a, x+1
+0565 4537       519       orl a, x+2
+0567 4538       520       orl a, x+3
+0569 7012       521       jnz PU32_go
+056B            522   
+056B 7430       523       mov a, #'0'
+056D 12054E     524       lcall putchar
+0570 22         525       ret
+0571            526       
+0571            527       
+0571            528   playSingle_beep: 
+0571 753301     529   mov beep_count, #1
+0574 22         530   ret
+0575            531   
+0575            532   ten_beeps:
+0575 75330A     533   mov beep_count, #10
+0578 22         534   ret
+0579            535   
+0579            536   five_beeps:
+0579 753305     537   mov beep_count, #5
+057C 22         538   ret
+057D            539   
+057D            540   PU32_go:
+057D 7F00       541       mov R7, #0          ; count digits pushed
+057F            542   
+057F            543   PU32_loop:
+057F 75390A     544            mov y+0, #low (10 % 0x10000) 
+0582 753A00     544            mov y+1, #high(10 % 0x10000) 
+0585 753B00     544            mov y+2, #low (10 / 0x10000) 
+0588 753C00     544            mov y+3, #high(10 / 0x10000) 
+058B 1202FE     545       lcall div32         ; x = x/10, remainder in y (0..9)
+058E            546   
+058E E539       547       mov a, y+0
+0590 2430       548       add a, #'0'         ; remainder -> ASCII digit
+0592 C0E0       549       push acc
+0594 0F         550       inc R7
+0595            551   
+0595 E535       552       mov a, x+0
+0597 4536       553       orl a, x+1
+0599 4537       554       orl a, x+2
+059B 4538       555       orl a, x+3
+059D 70E0       556       jnz PU32_loop
+059F            557   
+059F            558   PU32_pop:
+059F D0E0       559       pop acc
+05A1 12054E     560       lcall putchar
+05A4 DFF9       561       djnz R7, PU32_pop
+05A6 22         562       ret
+05A7            563   
+05A7            564   
+05A7            565   send_temp_serial:
+05A7            566       ; x = t_hot (centi-degC)
+05A7 854E35     567       mov x+0, t_hot+0
+05AA 854F36     568       mov x+1, t_hot+1
+05AD 855037     569       mov x+2, t_hot+2
+05B0 855138     570       mov x+3, t_hot+3
+05B3            571   
+05B3            572       ; x = x / 100  -> integer degrees C
+05B3 753964     573            mov y+0, #low (100 % 0x10000) 
+05B6 753A00     573            mov y+1, #high(100 % 0x10000) 
+05B9 753B00     573            mov y+2, #low (100 / 0x10000) 
+05BC 753C00     573            mov y+3, #high(100 / 0x10000) 
+05BF 1202FE     574       lcall div32          ; x now = integer °C (0..300-ish)
+05C2            575   
+05C2            576       ; --- print as exactly 3 digits: H T O ---
+05C2            577       ; R3:R4 = x (16-bit is enough here)
+05C2 AC35       578       mov R4, x+0
+05C4 AB36       579       mov R3, x+1
+05C6            580   
+05C6            581       ; hundreds in R2
+05C6 7A00       582       mov R2, #0
+05C8            583   
+05C8            584   Hund_loop:
+05C8            585       ; if (R3:R4) < 100 stop
+05C8 EB         586       mov a, R3
+05C9 7006       587       jnz Hund_sub
+05CB EC         588       mov a, R4
+05CC C3         589       clr c
+05CD 9464       590       subb a, #100
+05CF 400C       591       jc  Hund_done
+05D1            592   
+05D1            593   Hund_sub:
+05D1            594       ; (R3:R4) -= 100
+05D1 EC         595       mov a, R4
+05D2 C3         596       clr c
+05D3 9464       597       subb a, #100
+05D5 FC         598       mov R4, a
+05D6 EB         599       mov a, R3
+05D7 9400       600       subb a, #0
+05D9 FB         601       mov R3, a
+05DA 0A         602       inc R2
+05DB 80EB       603       sjmp Hund_loop
+05DD            604   
+05DD            605   Hund_done:
+05DD            606       ; print hundreds
+05DD EA         607       mov a, R2
+05DE 2430       608       add a, #'0'
+05E0 12054E     609       lcall putchar
+05E3            610   
+05E3            611       ; print tens and ones from remaining 0..99 in R4
+05E3 EC         612       mov a, R4
+05E4 75F00A     613       mov b, #10
+05E7 84         614       div ab              ; A=tens, B=ones
+05E8            615   
+05E8 2430       616       add a, #'0'
+05EA 12054E     617       lcall putchar
+05ED E5F0       618       mov a, b
+05EF 2430       619       add a, #'0'
+05F1 12054E     620       lcall putchar
+05F4            621   
+05F4            622       ; CRLF
+05F4 740D       623       mov a, #0Dh
+05F6 12054E     624       lcall putchar
+05F9 740A       625       mov a, #0Ah
+05FB 12054E     626       lcall putchar
+05FE 22         627       ret
+05FF            628   
+05FF            629   
+05FF            630   
+05FF            631   
+05FF            632   Read_ADC:
+05FF F5A1       633            mov ADC_C, a
+0601 A9A3       634            mov R1, ADC_H
+0603 A8A2       635            mov R0, ADC_L
+0605 22         636            ret
+0606            637   
+0606            638   ;---------------------------------
+0606            639   ; Read_Ref
+0606            640   ; Reads LM4040 reference on ADC channel 0
+0606            641   ; Stores 16-bit ADC count in VAL_LM4040 (low,high)
+0606            642   ;---------------------------------
+0606            643   Read_Ref:
+0606 7400       644       mov a, #00h            ; ADC channel 0 (AIN0)
+0608 1205FF     645       lcall Read_ADC
+060B 8852       646       mov VAL_LM4040+0, R0
+060D 8953       647       mov VAL_LM4040+1, R1
+060F 22         648       ret
+0610            649   
+0610            650   
+0610            651   ;---------------------------------
+0610            652   ; Read_op_amp_mv
+0610            653   ; Reads op-amp output on ADC channel 1 (you set #01h)
+0610            654   ; Computes V_amp_mv in TRUE mV:
+0610            655   ;   Vopamp_mV = ADC_opamp * 4096 / ADC_ref
+0610            656   ; Stores result as 32-bit in V_amp_mv
+0610            657   ;---------------------------------
+0610            658   Read_op_amp_mv:
+0610            659       ; if reference reading is 0, avoid divide-by-zero
+0610 E552       660       mov A, VAL_LM4040+0
+0612 4553       661       orl A, VAL_LM4040+1
+0614 700D       662       jnz _ref_ok
+0616            663   
+0616            664       ; V_amp_mv = 0
+0616 754200     665       mov V_amp_mv+0, #00h
+0619 754300     666       mov V_amp_mv+1, #00h
+061C 754400     667       mov V_amp_mv+2, #00h
+061F 754500     668       mov V_amp_mv+3, #00h
+0622 22         669       ret
+0623            670   
+0623            671   _ref_ok:
+0623            672       ; Read op-amp output ADC channel 1 (AIN1)
+0623 7401       673       mov a, #01h
+0625 1205FF     674       lcall Read_ADC
+0628            675   
+0628            676       ; x = ADC_opamp (16-bit)
+0628 8835       677       mov x+0, R0
+062A 8936       678       mov x+1, R1
+062C 753700     679       mov x+2, #00h
+062F 753800     680       mov x+3, #00h
+0632            681   
+0632            682       ; x = x * 4096  (mV)
+0632 7539C4     683            mov y+0, #low (2500 % 0x10000) 
+0635 753A09     683            mov y+1, #high(2500 % 0x10000) 
+0638 753B00     683            mov y+2, #low (2500 / 0x10000) 
+063B 753C00     683            mov y+3, #high(2500 / 0x10000) 
+063E 120271     684       lcall mul32
+0641            685   
+0641            686       ; y = ADC_ref (16-bit)
+0641 855239     687       mov y+0, VAL_LM4040+0
+0644 85533A     688       mov y+1, VAL_LM4040+1
+0647 753B00     689       mov y+2, #00h
+064A 753C00     690       mov y+3, #00h
+064D            691   
+064D            692       ; x = (ADC_opamp * 4096) / ADC_ref  => mV
+064D 1202FE     693       lcall div32
+0650            694   
+0650            695       ; store TRUE mV into V_amp_mv
+0650 853542     696       mov V_amp_mv+0, x+0
+0653 853643     697       mov V_amp_mv+1, x+1
+0656 853744     698       mov V_amp_mv+2, x+2
+0659 853845     699       mov V_amp_mv+3, x+3
+065C 22         700       ret
+065D            701   
+065D            702   
+065D            703   ;---------------------------------
+065D            704   ; VoutmV_To_TempC
+065D            705   ; Uses V_amp_mv (TRUE mV)
+065D            706   ; Steps:
+065D            707   ; 1) uV_opamp = mV * 1000
+065D            708   ; 2) uV_tc    = uV_opamp / GAIN (300)
+065D            709   ; 3) Temp_cC  = uV_tc * 100 / 41    (41 uV per 1°C)
+065D            710   ; 4) add T_cold (centi-°C)
+065D            711   ; Output: t_hot = total temp in centi-°C (°C*100)
+065D            712   ;---------------------------------
+065D            713   VoutmV_To_TempC:
+065D            714       ; x = V_amp_mv (mV)
+065D E542       715       mov A, V_amp_mv+0
+065F F535       716       mov x+0, A
+0661 E543       717       mov A, V_amp_mv+1
+0663 F536       718       mov x+1, A
+0665 E544       719       mov A, V_amp_mv+2
+0667 F537       720       mov x+2, A
+0669 E545       721       mov A, V_amp_mv+3
+066B F538       722       mov x+3, A
+066D            723   
+066D            724       ; uV_opamp = mV * 1000
+066D 7539E8     725            mov y+0, #low (1000 % 0x10000) 
+0670 753A03     725            mov y+1, #high(1000 % 0x10000) 
+0673 753B00     725            mov y+2, #low (1000 / 0x10000) 
+0676 753C00     725            mov y+3, #high(1000 / 0x10000) 
+0679 120271     726       lcall mul32
+067C            727   
+067C            728       ; uV_tc = uV_opamp / 300
+067C 75392C     729            mov y+0, #low (300 % 0x10000) 
+067F 753A01     729            mov y+1, #high(300 % 0x10000) 
+0682 753B00     729            mov y+2, #low (300 / 0x10000) 
+0685 753C00     729            mov y+3, #high(300 / 0x10000) 
+0688 1202FE     730       lcall div32
+068B            731   
+068B            732       ; Temp_cC = uV_tc * 100 / 41
+068B 753964     733            mov y+0, #low (100 % 0x10000) 
+068E 753A00     733            mov y+1, #high(100 % 0x10000) 
+0691 753B00     733            mov y+2, #low (100 / 0x10000) 
+0694 753C00     733            mov y+3, #high(100 / 0x10000) 
+0697 120271     734       lcall mul32
+069A            735   
+069A 753929     736            mov y+0, #low (41 % 0x10000) 
+069D 753A00     736            mov y+1, #high(41 % 0x10000) 
+06A0 753B00     736            mov y+2, #low (41 / 0x10000) 
+06A3 753C00     736            mov y+3, #high(41 / 0x10000) 
+06A6 1202FE     737       lcall div32          ; x now = temp in centi-°C from thermocouple only
+06A9            738   
+06A9            739       ; add cold junction temp (centi-°C)
+06A9 E54A       740       mov A, T_cold+0
+06AB F539       741       mov y+0, A
+06AD E54B       742       mov A, T_cold+1
+06AF F53A       743       mov y+1, A
+06B1 E54C       744       mov A, T_cold+2
+06B3 F53B       745       mov y+2, A
+06B5 E54D       746       mov A, T_cold+3
+06B7 F53C       747       mov y+3, A
+06B9            748       
+06B9            749       
+06B9            750       
+06B9            751   
+06B9 1201BC     752       lcall add32          ; x = x + y
+06BC            753   
+06BC            754       ; store into t_hot (centi-°C)
+06BC E535       755       mov A, x+0
+06BE F54E       756       mov t_hot+0, A
+06C0 E536       757       mov A, x+1
+06C2 F54F       758       mov t_hot+1, A
+06C4 E537       759       mov A, x+2
+06C6 F550       760       mov t_hot+2, A
+06C8 E538       761       mov A, x+3
+06CA F551       762       mov t_hot+3, A
+06CC 22         763       ret 
+06CD            764   
+06CD            765   
+06CD            766   send_temp_serial_simple:
+06CD 900372     767       mov dptr, #TempLabel
+06D0 120556     768       lcall SendString
+06D3            769       ; x = t_hot
+06D3 854E35     770       mov x+0, t_hot+0
+06D6 854F36     771       mov x+1, t_hot+1
+06D9 855037     772       mov x+2, t_hot+2
+06DC 855138     773       mov x+3, t_hot+3
+06DF 120561     774       lcall PrintU32
+06E2 740D       775       mov a, #0Dh
+06E4 12054E     776       lcall putchar
+06E7 740A       777       mov a, #0Ah
+06E9 12054E     778       lcall putchar
+06EC 22         779       ret
+06ED            780       
+06ED 30313233   781   HexTab: db '0123456789ABCDEF',0
+     34353637
+     38394142
+     43444546
+     00
+06FE            782   
+06FE            783   PrintHexNibble:
+06FE            784       ; A = 0..15
+06FE 9006ED     785       mov dptr, #HexTab
+0701 93         786       movc a, @a+dptr
+0702 12054E     787       lcall putchar
+0705 22         788       ret
+0706            789   
+0706            790   PrintHex8:
+0706            791       ; A = byte
+0706 C0E0       792       push acc
+0708 C4         793       swap a
+0709 540F       794       anl a, #0Fh
+070B 1206FE     795       lcall PrintHexNibble
+070E D0E0       796       pop acc
+0710 540F       797       anl a, #0Fh
+0712 1206FE     798       lcall PrintHexNibble
+0715 22         799       ret
+0716            800   
+0716            801   PrintHex16_R1R0:
+0716            802       ; prints R1 then R0 as 4 hex digits
+0716 E9         803       mov a, R1
+0717 120706     804       lcall PrintHex8
+071A E8         805       mov a, R0
+071B 120706     806       lcall PrintHex8
+071E 22         807       ret
+071F            808   
+071F 41494E30   809   ADC0Label: db 'AIN0=0x',0
+     3D307800
+0727 2041494E   810   ADC1Label: db ' AIN1=0x',0
+     313D3078
+     00
+0730            811   
+0730            812   send_adc_debug:
+0730            813       ; AIN0
+0730 7400       814       mov a, #00h
+0732 1205FF     815       lcall Read_ADC              ; R1:R0 valid?
+0735            816   
+0735 90071F     817       mov dptr, #ADC0Label
+0738 120556     818       lcall SendString
+073B 120716     819       lcall PrintHex16_R1R0
+073E            820   
+073E            821       ; AIN1
+073E 7401       822       mov a, #01h
+0740 1205FF     823       lcall Read_ADC
+0743            824   
+0743 900727     825       mov dptr, #ADC1Label
+0746 120556     826       lcall SendString
+0749 120716     827       lcall PrintHex16_R1R0
+074C            828   
+074C            829       ; CRLF
+074C 740D       830       mov a, #0Dh
+074E 12054E     831       lcall putchar
+0751 740A       832       mov a, #0Ah
+0753 12054E     833       lcall putchar
+0756 22         834       ret
+0757            835       
+0757 20566F70   836   VLabel: db ' Vop_mV=',0
+     5F6D563D
+     00
+0760            837       
+0760            838   PrintHex32_Vamp:
+0760            839       ; prints V_amp_mv+3..+0 as 8 hex digits
+0760 E545       840       mov a, V_amp_mv+3
+0762 120706     841       lcall PrintHex8
+0765 E544       842       mov a, V_amp_mv+2
+0767 120706     843       lcall PrintHex8
+076A E543       844       mov a, V_amp_mv+1
+076C 120706     845       lcall PrintHex8
+076F E542       846       mov a, V_amp_mv+0
+0771 120706     847       lcall PrintHex8
+0774 22         848       ret
+0775            849   
+0775            850   send_v_debug_hex:
+0775 900757     851       mov dptr, #VLabel
+0778 120556     852       lcall SendString
+077B 120760     853       lcall PrintHex32_Vamp
+077E 740D       854       mov a, #0Dh
+0780 12054E     855       lcall putchar
+0783 740A       856       mov a, #0Ah
+0785 12054E     857       lcall putchar
+0788 22         858       ret
+0789            859   
+0789            860   
+0789            861       
+0789            862   end
