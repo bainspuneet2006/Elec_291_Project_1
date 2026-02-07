@@ -189,129 +189,122 @@ Timer2_Init:
 	ret
 
 
-;---------------------------------;
-; ISR for timer 2                 ;
-;---------------------------------;
+
 Timer2_ISR:
-	clr TF2  ; Timer 2 doesn't clear TF2 automatically. Do it in ISR
-
-    ; FIX: DO NOT toggle P1.1 here. P1.1 is LCD E pin (ELCD_E equ P1.1)
-    ; cpl P1.1 ; <-- REMOVED
-
-	; Save registers used (stronger save to avoid corruption w/ LCD + math32)
-	push acc
-	push psw
+    clr TF2   ; Timer 2 doesn't clear TF2 automatically
+    push acc
+    push psw
     push b
     push dpl
     push dph
 
-	; Increment the 16-bit one mili second counter
-	inc Count1ms+0    ; Increment the low 8-bits first
-	mov a, Count1ms+0 ; If the low 8-bits overflow, then increment high 8-bits
-	jnz Inc_Done
-	inc Count1ms+1
+    ; --- PWM LOGIC ---
+    inc pwm_counter
+    mov a, pwm_counter
+    cjne a, #100, do_pwm_check
+    mov pwm_counter, #0
 
-	inc count_ms+0
-	mov a, count_ms+0
-	jnz Inc_Done
-	inc count_ms+1
-Inc_Done:
-	; Check if half second has passed
-	mov a, Count1ms+0
-	cjne a, #low(500), Timer2_ISR_done ; Warning: this instruction changes the carry flag!
-	mov a, Count1ms+1
-	cjne a, #high(500), Timer2_ISR_done
-	
-	
-	clr a
-	
-	mov a, count_ms+0
-	cjne a, #low(1000), check_pwm_val
-	mov a, count_ms+1
-	cjne a, #high(1000), check_pwm_val
-	
-	inc sec
-	clr a
-	mov count_ms+0, a
-	mov count_ms+1, a
-	
-	mov Count1ms+0, a
-	mov Count1ms+1, a
-	; 500 milliseconds have passed.  Set a flag so the main program knows
-	setb half_seconds_flag ; Let the main program know half second had passed
-	; Toggle LEDR0 so it blinks
-	cpl LEDRA.0
-	
-	mov a, beep_count
-	jz stop_beeping
-	
-	mov a, beep_state
-	jz turn_beep_on
-	
-	clr TR0 ; Enable/disable timer/counter 0. This line creates a beep-silence-beep-silence sound.
-	; Reset to zero the milli-seconds counter, it is a 16-bit variable
-	clr SOUND_OUT
-	mov beep_state, #0
-	dec beep_count
-	sjmp beep_done
-	
-	
-	turn_beep_on:
-	setb TR0
-	mov beep_state, #1
-	sjmp beep_done
-	
-	
-stop_beeping: 
-clr TR0
-clr SOUND_OUT
-mov beep_state, #0
-
-	
-	beep_done:
-	
-	; Increment the BCD counter
-	mov a, BCD_counter
-	jb UPDOWN, Timer2_ISR_decrement
-	add a, #0x01
-	sjmp Timer2_ISR_da
-	
-Timer2_ISR_decrement:
-	add a, #0x99 ; Adding the 10-complement of -1 is like subtracting 1.
-Timer2_ISR_da:
-	da a ; Decimal adjust instruction.  Check datasheet for more details!
-	mov BCD_counter, a
-
-
-inc pwm_counter
-mov a, pwm_counter
-cjne a, #100, check_pwm_val
-mov pwm_counter, #0
-
-
-check_pwm_val:
-
-clr c
-mov a, pwm_counter
-subb a, pwm
-jc turn_ssr_on
+do_pwm_check:
+    clr c
+    mov a, pwm_counter
+    subb a, pwm
+    jc turn_ssr_on
 
 turn_ssr_off:
-
-setb SSR_PIN
-sjmp Timer2_ISR_done
+    setb SSR_PIN       ; Turn OFF (Active Low logic: 1=OFF)
+    sjmp pwm_done
 
 turn_ssr_on:
-clr SSR_PIN
+    clr SSR_PIN        ; Turn ON (Active Low logic: 0=ON)
 
-Timer2_ISR_done:
+pwm_done:
+    ; --- TIME KEEPING ---
+    inc Count1ms+0
+    mov a, Count1ms+0
+    jnz Inc_High
+    inc Count1ms+1
+Inc_High:
+
+    inc count_ms+0
+    mov a, count_ms+0
+    jnz Inc_High_2
+    inc count_ms+1
+Inc_High_2:
+
+    ; Check 1000ms (1 Second)
+    mov a, count_ms+0
+    cjne a, #low(1000), Check_500ms
+    mov a, count_ms+1
+    cjne a, #high(1000), Check_500ms
+
+    ; 1 Second passed
+    inc sec            ; Update FSM timer
+    clr a
+    mov count_ms+0, a  ; Reset MS counter
+    mov count_ms+1, a
+
+Check_500ms:
+    mov a, Count1ms+0
+    cjne a, #low(500), beep_logic
+    mov a, Count1ms+1
+    cjne a, #high(500), beep_logic
+
+    ; 500ms passed
+    clr a
+    mov Count1ms+0, a
+    mov Count1ms+1, a
+    setb half_seconds_flag
+    cpl LEDRA.0
+
+    ; --- BEEP LOGIC --
+
+    mov a, beep_count
+    jz beep_logic
+    dec beep_count
+    
+beep_logic: 
+	mov a, beep_count
+	jz stop_beeping
+
+    mov a, Count1ms+1
+    jnz stop_beeping
+    mov a, Count1ms+0
+    cjne a, #100, check_less
+    sjmp stop_beeping
+    
+check_less:
+	jnc stop_beeping
+
+turn_beep_on_logic:
+    setb TR0
+    sjmp beep_logic_done
+
+stop_beeping:
+    clr TR0
+    clr SOUND_OUT
+    
+
+beep_logic_done:
+    ; --- BCD COUNTER ---
+    mov a, BCD_counter
+    jb UPDOWN, Timer2_ISR_decrement
+    add a, #0x01
+    da a
+    mov BCD_counter, a
+    sjmp Timer2_ISR_done_jump
+
+Timer2_ISR_decrement:
+    add a, #0x99
+    da a
+    mov BCD_counter, a
+
+Timer2_ISR_done_jump:
     pop dph
     pop dpl
     pop b
-	pop psw
-	pop acc
-	reti
-
+    pop psw
+    pop acc
+    reti
 
 ; Look-up table for the 7-seg displays. (Segments are turn on with zero)
 T_7seg:
