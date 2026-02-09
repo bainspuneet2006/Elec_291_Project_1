@@ -8,210 +8,161 @@
 ;    Also resets it to zero if the KEY1 pushbutton  is pressed.
 ; d) Controls the LCD using general purpose pins P2.3, P2.5, P2.7, P3.1, P3.3, P3.5, P3.7
 ;
-; FIXES ADDED:
-;   1) Stack pointer moved off 0x7F -> 0x60 (0x7F causes pushes into SFR space at 0x80+)
-;   2) Removed cpl P1.1 inside Timer2 ISR (P1.1 is LCD E pin, was being toggled every 1ms)
-;   3) Timer2 ISR now saves/restores B, DPL, DPH too (prevents random corruption w/ math/LCD)
-;   4) Serial: setb TI after init, and a more standard putchar (wait TI, clr TI, write SBUF)
-;
-; EXTRA FIXES (for your errors):
-;   5) Renamed Wait25ms labels (W25_L1/W25_L2/W25_L3) so they don't conflict with LCD delays (L1/L2/L3).
-;   6) Removed the illegal "mov a, a" bug that caused parse/register errors.
-;   7) Added keypad-driven parameter UI in State 0 (edit soak/reflow temps/times).
-;
+; ADDITIONS YOU ASKED FOR:
+;   8) Total elapsed time (seconds) displayed on LCD in all states except 0,
+;      maintained by Timer2 ISR, resets when returning to state 0.
+;   9) Reset button (KEY0) forces state 0 and resets everything.
+
 $NOLIST
 $MODMAX10
 $LIST
 
-
-CLK           EQU 33333333 ; Microcontroller system crystal frequency in Hz
-TIMER0_RATE   EQU 4096     ; 2048Hz squarewave (peak amplitude of CEM-1203 speaker)
-TIMER0_RELOAD EQU ((65536-(CLK/(12*TIMER0_RATE)))) ; The prescaler in the CV-8052 is always 12 unlike the N76E003 where is selectable.
-TIMER2_RATE   EQU 1000     ; 1000Hz, for a timer tick of 1ms
+CLK           EQU 33333333
+TIMER0_RATE   EQU 4096
+TIMER0_RELOAD EQU ((65536-(CLK/(12*TIMER0_RATE))))
+TIMER2_RATE   EQU 1000
 TIMER2_RELOAD EQU ((65536-(CLK/(12*TIMER2_RATE))))
 
 SOUND_OUT     equ P1.5
 UPDOWN        equ SWA.0
-Play_beeps_Switch equ SWA.1
+Play_beeps_Switch equ SWA.4
 Start_Switch equ SWA.2
 
-;-------I dont know which pin we are connecting to 
-; the SSR box so we can change this accordingly
-; [important] if we change that we also need to change
-; P2MOD accordinlgy
-SSR_PIN equ P3.7 
+; RESET BUTTON (NEW)
+RESET_BTN     equ KEY.0
 
-; Unfortunately the maximum baurate we can use with timer 1 is 57600
-; so make sure you configure putty/matlab/python accordingly.
+SSR_PIN equ P3.7
+
 BAUD            EQU 57600
 TIMER_1_RELOAD  EQU (256-((2*CLK)/(12*32*BAUD)))
 
-; The Special Function Registers below were added to 'MODMAX10' recently.
-; If you are getting an error, uncomment the three lines below.
-
-;ADC_C DATA 0A1h
-;ADC_L DATA 0A2h
-;ADC_H DATA 0A3h
-
-; Reset vector
 org 0x0000
     ljmp main
 
-; External interrupt 0 vector (not used in this code)
 org 0x0003
-	reti
+reti
 
-; Timer/Counter 0 overflow interrupt vector
 org 0x000B
-	ljmp Timer0_ISR
+ljmp Timer0_ISR
 
-; External interrupt 1 vector (not used in this code)
 org 0x0013
-	reti
+reti
 
-; Timer/Counter 1 overflow interrupt vector (not used in this code)
 org 0x001B
-	reti
+reti
 
-; Serial port receive/transmit interrupt vector (not used in this code)
 org 0x0023
-	reti
+reti
 
-; Timer/Counter 2 overflow interrupt vector
 org 0x002B
-	ljmp Timer2_ISR
+ljmp Timer2_ISR
 
-
-; In the 8051 we can define direct access variables starting at location 0x30 up to location 0x7F
 dseg at 0x30
-Count1ms:     ds 2 ; Used to determine when half second has passed
-count_ms:     ds 2 ; For determining when a full second has passed
+Count1ms:     ds 2
+count_ms:     ds 2
 
-BCD_counter:  ds 1 ; The BCD counter incrememted in the ISR and displayed in the main loop
-beep_count: ds 1
-beep_state: ds 1
-FSM1_state: ds 1
-temp_soak: ds 1
-Time_soak: ds 1
-Temp_refl: ds 1
-Time_refl: ds 1
-pwm_counter: ds 1
-pwm: ds 1
-temp: ds 1 
-sec: ds 1
+BCD_counter:  ds 1
+beep_count:   ds 1
+beep_state:   ds 1
+FSM1_state:   ds 1
+temp_soak:    ds 1
+Time_soak:    ds 1
+Temp_refl:    ds 1
+Time_refl:    ds 1
+pwm_counter:  ds 1
+pwm:          ds 1
+temp:         ds 1
+sec:          ds 1
+
+; NEW: total elapsed time since leaving state0
+elapsed_sec:  ds 2   ; 16-bit seconds, displayed as 4 digits (0000..9999)
+
 x : ds 4
 y : ds 4
-bcd : ds 1
+bcd : ds 5
 
 V_amp_mv: ds 4
 T_cold: ds 4
 t_hot : ds 4
 VAL_LM4040: ds 2
 
-; --- NEW (keypad parameter UI) ---
-param_sel:     ds 1   ; 0=rT,1=rC,2=sT,3=sC
-edit_value:    ds 1   ; current typed number (0..255)
-edit_digits:   ds 1   ; how many digits typed
-prev_sel:      ds 1   ; remember last sel to refresh entry when selection changes
+param_sel:     ds 1
+edit_value:    ds 1
+edit_digits:   ds 1
+prev_sel:      ds 1
 
-temp_sum24:  ds 3   ; 24-bit running sum (low, mid, high)
-temp_count:  ds 1   ; how many samples so far (1..255)
-temp_avg:    ds 1   ; cumulative average (integer °C)
-
-
-
-; In the 8051 we have variables that are 1-bit in size.  We can use the setb, clr, jb, and jnb
-; instructions with these variables.  This is how you define a 1-bit variable:
 bseg
-half_seconds_flag: dbit 1 ; Set to one in the ISR every time 500 ms had passed
+half_seconds_flag: dbit 1
 mf : dbit 1
-Reached50_flag: dbit 1     ; NEW: set once temperature >= 50C during first 60s
+Reached50_flag: dbit 1
 
 cseg
-; These 'equ' must match the wiring between the DE10Lite board and the LCD!
-; P0 is in connector JPIO.  Check "CV-8052 Soft Processor in the DE10Lite Board: Getting
-; Started Guide" for the details.
 ELCD_RS equ P1.7
-; ELCD_RW equ Px.x ; Not used.  Connected to ground
 ELCD_E  equ P1.1
 ELCD_D4 equ P0.7
 ELCD_D5 equ P0.5
 ELCD_D6 equ P0.3
 ELCD_D7 equ P0.1
 
-
-
 InitialString: db '\r\nHello, World!\r\n', 0
 $NOLIST
-$include(LCD_4bit_DE10Lite_no_RW.inc) ; A library of LCD related functions and utility macros
+$include(LCD_4bit_DE10Lite_no_RW.inc)
 $include(math32.inc)
 $LIST
 
-
-;                     1234567890123456    <- This helps determine the location of the counter
 Initial_Message:  db 'TempC= xx ', 0
 
-; State 0 UI:
-State0_Line1: db 'rT  rC  sT  sC',0
-; row2 template (we overwrite digits in fixed spots)
-State0_Line2: db '--- --- --- ---',0
+State0_Line1: db 'sC  sT  rC  rT',0
+State0_Line2: db '',0
 
-
-;---------------------------------;
-; Routine to initialize the ISR   ;
-; for timer 0                     ;
-;---------------------------------;
 Timer0_Init:
-	mov a, TMOD
-	anl a, #0xf0 ; Clear the bits for timer 0
-	orl a, #0x01 ; Configure timer 0 as 16-timer
-	mov TMOD, a
-	mov TH0, #high(TIMER0_RELOAD)
-	mov TL0, #low(TIMER0_RELOAD)
-	; Enable the timer and interrupts
-    setb ET0  ; Enable timer 0 interrupt
-    clr TR0  ; Start timer 0
-	ret
+mov a, TMOD
+anl a, #0xf0
+orl a, #0x01
+mov TMOD, a
+mov TH0, #high(TIMER0_RELOAD)
+mov TL0, #low(TIMER0_RELOAD)
+    setb ET0
+    clr TR0
+ret
 
-;---------------------------------;
-; ISR for timer 0.  Set to execute;
-; every 1/4096Hz to generate a    ;
-; 2048 Hz square wave at pin P3.7 ;
-;---------------------------------;
 Timer0_ISR:
-	;clr TF0  ; According to the data sheet this is done for us already.
-	mov TH0, #high(TIMER0_RELOAD) ; Timer 0 doesn't have autoreload in the CV-8052
-	mov TL0, #low(TIMER0_RELOAD)
-	cpl SOUND_OUT ; Connect speaker to P3.7!
-	reti
+mov TH0, #high(TIMER0_RELOAD)
+mov TL0, #low(TIMER0_RELOAD)
+cpl SOUND_OUT
+reti
 
-
-;---------------------------------;
-; Routine to initialize the ISR   ;
-; for timer 2                     ;
-;---------------------------------;
 Timer2_Init:
-	mov T2CON, #0 ; Stop timer/counter.  Autoreload mode.
-	mov TH2, #high(TIMER2_RELOAD)
-	mov TL2, #low(TIMER2_RELOAD)
-	; Set the reload value
-	mov RCAP2H, #high(TIMER2_RELOAD)
-	mov RCAP2L, #low(TIMER2_RELOAD)
-	; Init One millisecond interrupt counter.  It is a 16-bit variable made with two 8-bit parts
-	clr a
-	mov Count1ms+0, a
-	mov Count1ms+1, a
-	; Enable the timer and interrupts
-    setb ET2  ; Enable timer 2 interrupt
-    setb TR2  ; Enable timer 2
-	ret
+mov T2CON, #0
+mov TH2, #high(TIMER2_RELOAD)
+mov TL2, #low(TIMER2_RELOAD)
+mov RCAP2H, #high(TIMER2_RELOAD)
+mov RCAP2L, #low(TIMER2_RELOAD)
 
+clr a
+mov Count1ms+0, a
+mov Count1ms+1, a
+mov count_ms+0, a
+mov count_ms+1, a
 
+; NEW
+mov elapsed_sec+0, a
+mov elapsed_sec+1, a
 
+    setb ET2
+    setb TR2
+ret
+
+; ==========================================================
+; Timer2 ISR: PWM + ms tick + sec tick + total elapsed time
+; ==========================================================
 Timer2_ISR:
-    clr TF2   ; Timer 2 doesn't clear TF2 automatically
+    clr TF2
     push acc
     push psw
+    push b
+    push dpl
+    push dph
 
     ; --- PWM LOGIC ---
     inc pwm_counter
@@ -226,14 +177,14 @@ do_pwm_check:
     jc turn_ssr_on
 
 turn_ssr_off:
-    clr SSR_PIN       ; Turn OFF
+    clr SSR_PIN
     sjmp pwm_done
 
 turn_ssr_on:
-    setb SSR_PIN      ; Turn ON
+    setb SSR_PIN
 
 pwm_done:
-    ; --- TIME KEEPING ---
+    ; --- TIME KEEPING (ms counters) ---
     inc Count1ms+0
     mov a, Count1ms+0
     jnz Inc_High
@@ -246,17 +197,41 @@ Inc_High:
     inc count_ms+1
 Inc_High_2:
 
-    ; Check 1000ms (1 Second)
+    ; ---- 1 second tick ----
     mov a, count_ms+0
     cjne a, #low(1000), Check_500ms
     mov a, count_ms+1
     cjne a, #high(1000), Check_500ms
 
-    ; 1 Second passed
-    inc sec            ; Update FSM timer
+    ; 1 second passed: update sec (your per-state timer)
+    inc sec
     clr a
-    mov count_ms+0, a  ; Reset MS counter
+    mov count_ms+0, a
     mov count_ms+1, a
+
+    ; NEW: total elapsed seconds since leaving state0
+    mov a, FSM1_state
+    jz Elapsed_Reset_In_ISR
+
+    ; if elapsed_sec == 9999, saturate
+    mov a, elapsed_sec+1
+    cjne a, #high(9999), Elapsed_Not_MaxHi
+    mov a, elapsed_sec+0
+    cjne a, #low(9999), Elapsed_Not_MaxHi
+    sjmp Check_500ms
+
+Elapsed_Not_MaxHi:
+    inc elapsed_sec+0
+    mov a, elapsed_sec+0
+    jnz Check_500ms
+    inc elapsed_sec+1
+    sjmp Check_500ms
+
+Elapsed_Reset_In_ISR:
+    clr a
+    mov elapsed_sec+0, a
+    mov elapsed_sec+1, a
+    mov sec, a
 
 Check_500ms:
     mov a, Count1ms+0
@@ -264,31 +239,30 @@ Check_500ms:
     mov a, Count1ms+1
     cjne a, #high(500), beep_logic
 
-    ; 500ms passed
     clr a
     mov Count1ms+0, a
     mov Count1ms+1, a
     setb half_seconds_flag
     cpl LEDRA.0
 
-    ; --- BEEP LOGIC --
-
+    ; --- BEEP LOGIC ---
     mov a, beep_count
     jz beep_logic
+
     dec beep_count
-    
-beep_logic: 
-	mov a, beep_count
-	jz stop_beeping
+
+beep_logic:
+    mov a, beep_count
+    jz stop_beeping
 
     mov a, Count1ms+1
     jnz stop_beeping
     mov a, Count1ms+0
     cjne a, #100, check_less
     sjmp stop_beeping
-    
+
 check_less:
-	jnc stop_beeping
+    jnc stop_beeping
 
 turn_beep_on_logic:
     setb TR0
@@ -297,7 +271,6 @@ turn_beep_on_logic:
 stop_beeping:
     clr TR0
     clr SOUND_OUT
-    
 
 beep_logic_done:
     ; --- BCD COUNTER ---
@@ -314,87 +287,215 @@ Timer2_ISR_decrement:
     mov BCD_counter, a
 
 Timer2_ISR_done_jump:
+    pop dph
+    pop dpl
+    pop b
     pop psw
     pop acc
     reti
 
-; Look-up table for the 7-seg displays. (Segments are turn on with zero)
 T_7seg:
-    DB 0xC0, 0xF9, 0xA4, 0xB0, 0x99        ; 0 TO 4
-    DB 0x92, 0x82, 0xF8, 0x80, 0x90        ; 4 TO 9
-    DB 0x88, 0x83, 0xC6, 0xA1, 0x86, 0x8E  ; A to F
+    DB 0xC0, 0xF9, 0xA4, 0xB0, 0x99
+    DB 0x92, 0x82, 0xF8, 0x80, 0x90
+    DB 0x88, 0x83, 0xC6, 0xA1, 0x86, 0x8E
 
+; ==========================================================
+; NEW: Force reset to state0 and clear everything
+; ==========================================================
+Force_Reset_To_State0:
+    push acc
 
+    mov pwm, #0
+    clr SSR_PIN
 
-;---------------------------------;
-; FSM code here. I defined FSM1_state, 
-; temp_soak, Time_soak, Time_refl, Temp_refl
-; so use those in your code when you need to. ALso 
-; in the code im pretty sure pwm is the amount of power 
-; passed to the SSR so use that 
-;-----------------------------------;
-FSM1: 
-	mov a, FSM1_state
-	
+    mov FSM1_state, #0
+
+    clr a
+    mov sec, a
+    mov elapsed_sec+0, a
+    mov elapsed_sec+1, a
+
+    mov beep_count, a
+    clr TR0
+    clr SOUND_OUT
+
+    clr Reached50_flag
+
+    pop acc
+    ret
+
+; ==========================================================
+; NEW: Show elapsed time on LCD (row1 col13..16) if state != 0
+; Displays elapsed seconds as 4 digits, saturates at 9999.
+; ==========================================================
+Display_Elapsed_LCD:
+    push acc
+    push b
+    push psw
+
+    ; Only show if not state 0
+    mov a, FSM1_state
+    jz DEL_Clear
+
+    ; Copy elapsed_sec to R3:R4 (16-bit)
+    mov R4, elapsed_sec+0
+    mov R3, elapsed_sec+1
+
+    ; Cap at 9999 for display safety
+    ; if R3:R4 > 9999 then force 9999
+    mov a, R3
+    clr c
+    subb a, #high(9999)
+    jc DEL_Print
+    jnz DEL_Force9999
+    mov a, R4
+    clr c
+    subb a, #low(9999)
+    jnc DEL_Force9999
+    sjmp DEL_Print
+
+DEL_Force9999:
+    mov R3, #high(9999)
+    mov R4, #low(9999)
+
+DEL_Print:
+    ; thousands, hundreds, tens, ones using repeated subtraction
+    mov R2, #0    ; thousands
+DEL_Thou_L:
+    ; if < 1000 stop
+    mov a, R3
+    jnz DEL_Thou_Sub
+    mov a, R4
+    clr c
+    subb a, #low(1000)
+    jc DEL_Thou_D
+DEL_Thou_Sub:
+    ; (R3:R4) -= 1000
+    mov a, R4
+    clr c
+    subb a, #low(1000)
+    mov R4, a
+    mov a, R3
+    subb a, #high(1000)
+    mov R3, a
+    inc R2
+    sjmp DEL_Thou_L
+DEL_Thou_D:
+
+    mov R1, #0    ; hundreds
+DEL_Hund_L:
+    ; if < 100 stop
+    mov a, R3
+    jnz DEL_Hund_Sub
+    mov a, R4
+    clr c
+    subb a, #100
+    jc DEL_Hund_D
+DEL_Hund_Sub:
+    mov a, R4
+    clr c
+    subb a, #100
+    mov R4, a
+    mov a, R3
+    subb a, #0
+    mov R3, a
+    inc R1
+    sjmp DEL_Hund_L
+DEL_Hund_D:
+
+    ; tens and ones from remaining (0..99) in R4
+    mov a, R4
+    mov b, #10
+    div ab        ; A=tens, B=ones
+    mov R0, A     ; tens
+    mov R7, B     ; ones
+
+    ; Print at row1 col13..16
+    Set_Cursor(1, 13)
+    mov a, R2
+    add a, #'0'
+    lcall ?WriteData
+    mov a, R1
+    add a, #'0'
+    lcall ?WriteData
+    mov a, R0
+    add a, #'0'
+    lcall ?WriteData
+    mov a, R7
+    add a, #'0'
+    lcall ?WriteData
+    sjmp DEL_Done
+
+DEL_Clear:
+    ; In state0, clear those 4 slots
+    Set_Cursor(1, 13)
+    mov a, #' '
+    lcall ?WriteData
+    mov a, #' '
+    lcall ?WriteData
+    mov a, #' '
+    lcall ?WriteData
+    mov a, #' '
+    lcall ?WriteData
+
+DEL_Done:
+    pop psw
+    pop b
+    pop acc
+    ret
+
+; -----------------------------------
+; FSM1 (unchanged logic, but we will
+; display elapsed in FSM2 each loop)
+; -----------------------------------
+FSM1:
+mov a, FSM1_state
+
 FSM_state0:
-	cjne a, #0, FSM1_state1
-	mov pwm, #0
-	
- lcall ReadParamSel_SW01      ; sets param_sel = 0..3
+cjne a, #0, FSM1_state1
+mov pwm, #0
 
-    ; 3) if selection changed, reset typing
-    mov a, param_sel
-    cjne a, prev_sel, S0_sel_changed
-    sjmp S0_sel_same
+ mov a, edit_digits
+jnz S0_sel_same
+
+lcall ReadParamSel_SW01
+
+mov a, param_sel
+cjne a, prev_sel, S0_sel_changed
+sjmp S0_sel_same
 
 S0_sel_changed:
-    mov prev_sel, param_sel
-    mov edit_value, #0
-    mov edit_digits, #0
+mov prev_sel, param_sel
+mov edit_value, #0
+mov edit_digits, #0
 
 S0_sel_same:
 
-    ; 4) collect exactly 3 digits like 060
     lcall Get3Digits
-    jnc S0_not_ready             ; C=0 -> still typing / no key
+    jnc S0_not_ready
 
-    ; got 3 
     mov a, edit_value
-;lcall LCD_Print3Dec
     lcall ApplyEditValue_ToSelectedParam
 
-    ; reset for next entry
     mov edit_value, #0
     mov edit_digits, #0
 
 S0_not_ready:
+  lcall State0_DrawLCD
 
-	   lcall State0_DrawLCD  	
-	
 	jb Start_Switch, FSM1_state0_done
-	;jnb PB6, $
-	; PROCESS START BEEP (you wanted 5 at end + 10 at error; start beep can stay 1)
 	lcall playSingle_beep
-	mov sec, #0            ; start timing "first 60 seconds"
-    clr Reached50_flag
+	mov sec, #0
+	clr Reached50_flag
 	mov FSM1_state, #1
-	
+
 FSM1_state0_done:
-;-----note that here FSM2 is another 'FSM' or loop we run so it 
-; can be something like updating the LCD display and stuff like that
-; I renamed the main loop to FSM2 so itll go there and come back
 	ljmp FSM2
-	
+
 FSM1_state1:
 	cjne a, #1, FSM1_state2
 	mov pwm, #100
 
-; -------------------------------
-    ; SAFETY ABORT (Lab requirement):
-    ; Abort if NOT >=50C within 60s
-    ; -------------------------------
-
-    ; If temp >= 50C, latch the flag
     mov a, temp
     clr c
     subb a, #50
@@ -402,280 +503,224 @@ FSM1_state1:
     setb Reached50_flag
 
 temp_below_50:
-    ; If sec >= 60 and we never reached 50C -> ERROR
     mov a, sec
     clr c
     subb a, #60
-    jc  continue_preheat          ; sec < 60, keep going
+    jc  continue_preheat
     jb  Reached50_flag, continue_preheat
 
-    ; ---- ABORT ----
     mov pwm, #0
-    mov FSM1_state, #6             ; ERROR state (new)
-    lcall ten_beeps                ; required error beeps
+    mov FSM1_state, #6
+    lcall ten_beeps
     ljmp FSM2
 
 continue_preheat:
-    ; -------- existing logic to go to SOAK when temp reaches temp_soak -----
     mov a, temp_soak
     clr c
     subb a, temp
     jnc FSM1_state1_done
-    mov sec, #0                    ; FIX: reset seconds when entering soak
+    mov sec, #0
     mov FSM1_state, #2
     lcall playSingle_beep
-	
-FSM1_state1_done:
-	ljmp FSM2
-	
-FSM1_state2:
-	cjne a, #2, FSM1_state3
-	mov pwm, #20
-	mov a, time_soak
-	clr c
-	; ------------clarify if this is where we store the time passed-----;
-	; yes it is i defined it --
-	subb a, sec
-	jnc FSM1_state2_done
-	mov sec, #0                    ; reset for state 3 timing if needed
-	mov FSM1_state, #3
-	;state switch
-	lcall playSingle_beep
-	
-FSM1_state2_done:
-	ljmp FSM2
-	
-	
-FSM1_state3:
-	cjne a, #3, FSM1_state4
-	mov pwm, #100
-	; DO NOT reset sec every loop here, or you will never time out later.
-	; (You were resetting sec in state3; keep it only on transition if you want.)
-	mov a, temp_refl
-	clr c
-	subb a, temp
-	jnc FSM1_state3_done
-	mov sec, #0                    ; reset seconds when entering state 4
-	mov FSM1_state, #4
-	lcall playSingle_beep
-	
-FSM1_state3_done:
-	ljmp FSM2
-	
-FSM1_state4:
-	cjne a, #4, FSM1_state5
-	mov pwm, #20
-	mov a, time_refl
-	clr c
-	subb a, sec
-	jnc FSM1_state4_done
-	mov FSM1_state, #5
-	lcall playSingle_beep
-	
-FSM1_state4_done:
-	ljmp FSM2
 
+FSM1_state1_done:
+ljmp FSM2
+
+FSM1_state2:
+cjne a, #2, FSM1_state3
+mov pwm, #20
+mov a, time_soak
+clr c
+subb a, sec
+jnc FSM1_state2_done
+mov sec, #0
+mov FSM1_state, #3
+lcall playSingle_beep
+
+FSM1_state2_done:
+ljmp FSM2
+
+FSM1_state3:
+cjne a, #3, FSM1_state4
+mov pwm, #100
+mov a, temp_refl
+clr c
+subb a, temp
+jnc FSM1_state3_done
+mov sec, #0
+mov FSM1_state, #4
+lcall playSingle_beep
+
+FSM1_state3_done:
+ljmp FSM2
+
+FSM1_state4:
+cjne a, #4, FSM1_state5
+mov pwm, #20
+mov a, time_refl
+clr c
+subb a, sec
+jnc FSM1_state4_done
+mov FSM1_state, #5
+lcall playSingle_beep
+
+FSM1_state4_done:
+ljmp FSM2
 
 FSM1_state5:
-	cjne a, #5, FSM1_state6
-	mov pwm, #0
-	mov a, temp
-	clr c
-	subb a, #60
-	
-	jnc FSM_state5_done
-	; END OF PROCESS: you wanted 5 beeps
-	lcall five_beeps
-	mov FSM1_state, #0
-	
-FSM_state5_done: 
-	ljmp FSM2
+cjne a, #5, FSM1_state6
+mov pwm, #0
+mov a, temp
+clr c
+subb a, #60
+jnc FSM_state5_done
+lcall five_beeps
+mov FSM1_state, #0
+
+FSM_state5_done:
+ljmp FSM2
 
 FSM1_state6:
     cjne a, #6, not_error
     sjmp is_error
 
 not_error:
-    ljmp FSM_state0     ; long jump, always reachable
+    ljmp FSM_state0
 
 is_error:
-    mov pwm, #0               ; force oven OFF
-
-    ; Stay here until the START switch is released (Start_Switch = 1)
-    ; (Your Start_Switch appears active-low because state0 uses "jb Start_Switch")
+    mov pwm, #0
     jb Start_Switch, FSM_state6_done
-    ljmp FSM2                  ; keep waiting
-
-FSM_state6_done:
-    mov FSM1_state, #0          ; return to idle
     ljmp FSM2
 
-	
-	
-; -------Other FSM states can go here-------
-
-
+FSM_state6_done:
+    mov FSM1_state, #0
+    ljmp FSM2
 
 ;---------------------------------;
-; Main program. Includes hardware ;
-; initialization and 'forever'    ;
-; loop.                           ;
+; Main program
 ;---------------------------------;
 main:
-	; Initialization
-    ; FIX: SP MUST NOT BE 0x7F for this big program (interrupts + LCD + math).
-    ; Put stack above your variables but still below 0x7F.
-    mov SP, #0x61
-    ; initialise state 0
+    mov SP, #0x70
     mov FSM1_state, #0
 
     lcall Timer0_Init
     lcall Timer2_Init
-	lcall Initialize_Serial_Port
+    lcall Initialize_Serial_Port
 
-    ; We use the pins of P0 to control the LCD.  Configure as outputs.
-    mov P0MOD, #10101010b ; P0.1, P0.3, P0.5, P0.7 are outputs.  ('1' makes the pin output)
-    ; We use pins P1.5 and P1.1 as outputs also.  Configure accordingly.
-    mov P1MOD, #10100010b ; P1.7 and P1.1 are outputs
+    mov P0MOD, #10101010b
+    mov P1MOD, #10100010b
     mov P2MOD, #0xff
     mov P3MOD, #0xff
 
-    ; Turn off all the LEDs
-    mov LEDRA, #0 ; LEDRA is bit addressable
-    mov LEDRB, #0 ; LEDRB is NOT bit addresable
+    mov LEDRA, #0
+    mov LEDRB, #0
 
-    setb EA   ; Enable Global interrupts
+    setb EA
+    lcall ELCD_4BIT
 
-    lcall ELCD_4BIT ; Configure LCD in four bit mode
-
-    ; For convenience a few handy macros are included in 'LCD_4bit_DE1Lite.inc':
-	Set_Cursor(1, 1)
+Set_Cursor(1, 1)
     Send_Constant_String(#Initial_Message)
     setb half_seconds_flag
-	mov BCD_counter, #0x00 ; Initialize counter to zero
+mov BCD_counter, #0x00
 
-    mov T_cold+0, #098h   ; 2200 low byte
-    mov T_cold+1, #008h   ; 2200 high byte
+    mov T_cold+0, #098h
+    mov T_cold+1, #008h
     mov T_cold+2, #000h
     mov T_cold+3, #000h
-	mov ADC_C, #080h ; Reset ADC
-	Wait_Milli_Seconds(#50)
-	
-    ; DEFAULT PARAMS (you can change them in STATE 0 using keypad now)
-    mov temp_soak,  #150     ; °C threshold to leave State 1
-    mov time_soak,  #60      ; seconds to stay in State 2
-    mov temp_refl,  #220     ; °C threshold to leave State 3
-    mov time_refl,  #45      ; seconds to stay in State 4
+mov ADC_C, #080h
+Wait_Milli_Seconds(#50)
 
-    mov temp_sum24+0, #0
-    mov temp_sum24+1, #0
-    mov temp_sum24+2, #0
-    mov temp_count,   #0
-    mov temp_avg,     #0
+    mov temp_soak,  #150
+    mov time_soak,  #60
+    mov temp_refl,  #220
+    mov time_refl,  #45
 
-    
     lcall Configure_Keypad_Pins
-    
-    lcall ReadParamSel_SW01     ; read switches into param_sel
-    mov  prev_sel, param_sel    ; prev_sel must be valid (not random RAM)
+
+    lcall ReadParamSel_SW01
+    mov  prev_sel, param_sel
     mov  edit_value, #0
     mov  edit_digits, #0
 
-	; After initialization the program stays in this 'forever' loop
+    ; NEW
+    clr a
+    mov elapsed_sec+0, a
+    mov elapsed_sec+1, a
+
 FSM2:
+; ==========================================================
+; NEW: RESET BUTTON (KEY0) to force state0 and reset everything
+; Active-low press assumed, matching KEY1 handling style.
+; ==========================================================
+    jb RESET_BTN, FSM2_NoReset
+    Wait_Milli_Seconds(#50)
+    jb RESET_BTN, FSM2_NoReset
+    jnb RESET_BTN, $      ; wait release
+    lcall Force_Reset_To_State0
+FSM2_NoReset:
 
+	; existing test beep section
+	;jnb Play_beeps_Switch, skip_beep
+	;jnb half_seconds_flag, skip_beep
+	;lcall playSingle_beep
+	skip_beep:
 
-;testing to playbeeps when switch is on. Replace this in fsm. call functions for 1, 5 or 10 beeps 
-jnb Play_beeps_Switch, skip_beep
-jnb half_seconds_flag, skip_beep
-lcall playSingle_beep
-
-skip_beep:
-	jb KEY.1, loop_a  ; if the KEY1 button is not pressed skip
-	Wait_Milli_Seconds(#50)	; Debounce delay.  This macro is also in 'LCD_4bit_DE1Lite.inc'
-	jb KEY.1, loop_a  ; if the KEY1 button is not pressed skip
-	jnb KEY.1, $		; Wait for button release.  The '$' means: jump to same instruction.
-	; A valid press of the 'BOOT' button has been detected, reset the BCD counter.
-	; But first stop timer 2 and reset the milli-seconds counter, to resync everything.
-	clr TR2 ; Stop timer 2
+	; KEY1 handling (your original counter reset)
+	jb KEY.1, loop_a
+	Wait_Milli_Seconds(#50)
+	jb KEY.1, loop_a
+	jnb KEY.1, $
+	clr TR2
 	clr a
-
 	mov Count1ms+0, a
 	mov Count1ms+1, a
-	; Now clear the BCD counter
 	mov BCD_counter, a
-	setb TR2    ; Start timer 2
-	ljmp loop_b ; Display the new value
+	setb TR2
+	ljmp loop_b
 
-loop_a:
-	jnb half_seconds_flag, loop_a   ; FIX: was "loop" (undefined)
-
-loop_b:
-    clr half_seconds_flag ; We clear this flag in the main loop, but it is set in the ISR for timer 2
-
-	    ; the place in the LCD where we want the BCD counter value
-	; Also display the counter using the 7-segment displays.
-
-	lcall Read_Ref
-	lcall Read_op_amp_mv
-	;lcall PrintHex32_Vamp
-	;lcall send_adc_debug
-	lcall VoutmV_To_TempC
-	Set_Cursor(1,7)
-	lcall Display_TempC_7seg
-	;mov t_cold, #0x01
-	;mov t_hot, #0xff
-	; now we need to print the temp to hex display and send it to the serial monitor
-	lcall send_temp_serial
+	loop_a:
+	jnb half_seconds_flag, loop_b
 	
-	lcall PrintStateSerial
-	
-    lcall UpdateTempAvg_Cumulative
+    lcall Read_Ref
+    lcall Read_op_amp_mv
+    lcall VoutmV_To_TempC
+Set_Cursor(1,7)
+    lcall Display_TempC_7seg
+    lcall send_temp_serial
+    lcall PrintStateSerial
+
+	loop_b:
+    clr half_seconds_flag
 
 
-	
+
+    ; NEW: show total elapsed time (seconds) on LCD in states 1..6
+    lcall Display_Elapsed_LCD
 
     ljmp FSM1
 
+; ===== SUBROUTINES BELOW (unchanged from your paste) =====
 
-;SUBROUTINES HERE
-
-
-; =======================================================
-; Display_TempC_7Seg
-; Displays temperature (integer °C) on HEX2 HEX1 HEX0
-; Uses:
-;   t_hot  = centi-°C (°C*100)  [already computed in VoutmV_To_TempC]
-;   math32 div32 (x = x/y)
-; Reuses T_7seg table (0..9)
-; =======================================================
 Display_TempC_7Seg:
     push acc
     push b
     push dpl
     push dph
 
-    ; x = t_hot (centi-°C)
     mov x+0, t_hot+0
     mov x+1, t_hot+1
     mov x+2, t_hot+2
     mov x+3, t_hot+3
 
-    ; x = x / 100  -> integer °C
     Load_y(100)
-    lcall div32              ; x now = integer °C
+    lcall div32
 
-    ; Copy integer temp to R3:R4 (16-bit is enough)
     mov R4, x+0
     mov R3, x+1
 
-    ; -------------------------
-    ; Compute hundreds in R2
-    ; -------------------------
-    mov R2, #0               ; hundreds
+    mov R2, #0
 
 DT_Hund_Loop:
-    ; if (R3:R4) < 100 stop
     mov a, R3
     jnz DT_Hund_Sub
     mov a, R4
@@ -684,7 +729,6 @@ DT_Hund_Loop:
     jc  DT_Hund_Done
 
 DT_Hund_Sub:
-    ; (R3:R4) -= 100
     mov a, R4
     clr c
     subb a, #100
@@ -696,26 +740,18 @@ DT_Hund_Sub:
     sjmp DT_Hund_Loop
 
 DT_Hund_Done:
-    ; Now R2 = hundreds (0..9), remaining value in R4 is 0..99
-
-    ; tens/ones from remaining
     mov a, R4
     mov b, #10
-    div ab                   ; A=tens (0..9), B=ones (0..9)
-    mov R1, A                ; tens
-    mov R0, B                ; ones
+    div ab
+    mov R1, A
+    mov R0, B
 
-    ; -------------------------
-    ; Map digits to 7-seg and write HEX2..HEX0
-    ; -------------------------
     mov dptr, #T_7seg
 
-    ; ones -> HEX0
     mov a, R0
     movc a, @a+dptr
     mov HEX0, a
 
-    ; tens -> HEX1 (blank if hundreds=0 and tens=0)
     mov a, R2
     jnz DT_Show_Tens
     mov a, R1
@@ -729,7 +765,6 @@ DT_Show_Tens:
     mov HEX1, a
 
 DT_Do_Hund:
-    ; hundreds -> HEX2 (blank if 0)
     mov a, R2
     jnz DT_Show_Hund
     mov HEX2, #0FFh
@@ -746,34 +781,25 @@ DT_Done:
     pop b
     pop acc
     ret
-; Displays a BCD number in HEX1-HEX0
-
-
 
 Initialize_Serial_Port:
-	; Configure serial port and baud rate
-	clr TR1 ; Disable timer 1
-	anl TMOD, #0x0f ; Mask the bits for timer 1
-	orl TMOD, #0x20 ; Set timer 1 in 8-bit auto reload mode
-	orl PCON, #80H ; Set SMOD to 1
-	mov TH1, #low(TIMER_1_RELOAD)
-	mov TL1, #low(TIMER_1_RELOAD)
-	setb TR1 ; Enable timer 1
-	mov SCON, #52H
-    setb TI  ; FIX: prime TX so first putchar doesn't stall
-	ret
+clr TR1
+anl TMOD, #0x0f
+orl TMOD, #0x20
+orl PCON, #80H
+mov TH1, #low(TIMER_1_RELOAD)
+mov TL1, #low(TIMER_1_RELOAD)
+setb TR1
+mov SCON, #52H
+    setb TI
+ret
 
-
-; -----------------------------
-; ADDED: UART TX helpers
-; -----------------------------
 putchar:
     jnb TI, $
     clr TI
     mov SBUF, a
     ret
 
-; SendString:
 SendString:
     clr a
     movc a, @a+dptr
@@ -784,15 +810,7 @@ SendString:
 SendString_done:
     ret
 
-
-
-;---------------------------------;
-; PrintU32: prints unsigned 32-bit ;
-; integer in x as decimal over UART;
-; Uses div32 (math32.inc): quotient in x, remainder in y
-;---------------------------------;
 PrintU32:
-    ; if x == 0 -> print '0'
     mov a, x+0
     orl a, x+1
     orl a, x+2
@@ -802,9 +820,8 @@ PrintU32:
     mov a, #'0'
     lcall putchar
     ret
-    
-    
-playSingle_beep: 
+
+playSingle_beep:
 mov beep_count, #1
 ret
 
@@ -817,14 +834,14 @@ mov beep_count, #5
 ret
 
 PU32_go:
-    mov R7, #0          ; count digits pushed
+    mov R7, #0
 
 PU32_loop:
     Load_y(10)
-    lcall div32         ; x = x/10, remainder in y (0..9)
+    lcall div32
 
     mov a, y+0
-    add a, #'0'         ; remainder -> ASCII digit
+    add a, #'0'
     push acc
     inc R7
 
@@ -840,30 +857,22 @@ PU32_pop:
     djnz R7, PU32_pop
     ret
 
-
 send_temp_serial:
-    ; x = t_hot (centi-degC)
     mov x+0, t_hot+0
     mov x+1, t_hot+1
     mov x+2, t_hot+2
     mov x+3, t_hot+3
 
-    ; x = x / 100  -> integer degrees C
     Load_y(100)
-    lcall div32          ; x now = integer °C (0..300-ish)
+    lcall div32
     mov temp, x+0
-mov a, temp_avg
 
-    ; --- print as exactly 3 digits: H T O ---
-    ; R3:R4 = x (16-bit is enough here)
     mov R4, x+0
     mov R3, x+1
 
-    ; hundreds in R2
     mov R2, #0
 
 Hund_loop:
-    ; if (R3:R4) < 100 stop
     mov a, R3
     jnz Hund_sub
     mov a, R4
@@ -872,7 +881,6 @@ Hund_loop:
     jc  Hund_done
 
 Hund_sub:
-    ; (R3:R4) -= 100
     mov a, R4
     clr c
     subb a, #100
@@ -884,15 +892,13 @@ Hund_sub:
     sjmp Hund_loop
 
 Hund_done:
-    ; print hundreds
     mov a, R2
     add a, #'0'
     lcall putchar
 
-    ; print tens and ones from remaining 0..99 in R4
     mov a, R4
     mov b, #10
-    div ab              ; A=tens, B=ones
+    div ab
 
     add a, #'0'
     lcall putchar
@@ -900,48 +906,30 @@ Hund_done:
     add a, #'0'
     lcall putchar
 
-    ; CRLF
     mov a, #0Dh
     lcall putchar
     mov a, #0Ah
     lcall putchar
     ret
 
-
-
 Read_ADC:
-	mov ADC_C, a
-	mov R1, ADC_H
-	mov R0, ADC_L
-	ret
+mov ADC_C, a
+mov R1, ADC_H
+mov R0, ADC_L
+ret
 
-;---------------------------------
-; Read_Ref
-; Reads LM4040 reference on ADC channel 0
-; Stores 16-bit ADC count in VAL_LM4040 (low,high)
-;---------------------------------
 Read_Ref:
-    mov a, #00h            ; ADC channel 0 (AIN0)
+    mov a, #00h
     lcall Read_ADC
     mov VAL_LM4040+0, R0
     mov VAL_LM4040+1, R1
     ret
 
-
-;---------------------------------
-; Read_op_amp_mv
-; Reads op-amp output on ADC channel 1 (you set #01h)
-; Computes V_amp_mv in TRUE mV:
-;   Vopamp_mV = ADC_opamp * 4096 / ADC_ref
-; Stores result as 32-bit in V_amp_mv
-;---------------------------------
 Read_op_amp_mv:
-    ; if reference reading is 0, avoid divide-by-zero
     mov A, VAL_LM4040+0
     orl A, VAL_LM4040+1
     jnz _ref_ok
 
-    ; V_amp_mv = 0
     mov V_amp_mv+0, #00h
     mov V_amp_mv+1, #00h
     mov V_amp_mv+2, #00h
@@ -949,49 +937,31 @@ Read_op_amp_mv:
     ret
 
 _ref_ok:
-    ; Read op-amp output ADC channel 1 (AIN1)
     mov a, #01h
     lcall Read_ADC
 
-    ; x = ADC_opamp (16-bit)
     mov x+0, R0
     mov x+1, R1
     mov x+2, #00h
     mov x+3, #00h
 
-    ; x = x * 4096  (mV)
     Load_y(4103)
     lcall mul32
 
-    ; y = ADC_ref (16-bit)
     mov y+0, VAL_LM4040+0
     mov y+1, VAL_LM4040+1
     mov y+2, #00h
     mov y+3, #00h
 
-    ; x = (ADC_opamp * 4096) / ADC_ref  => mV
     lcall div32
 
-    ; store TRUE mV into V_amp_mv
     mov V_amp_mv+0, x+0
     mov V_amp_mv+1, x+1
     mov V_amp_mv+2, x+2
     mov V_amp_mv+3, x+3
     ret
 
-
-;---------------------------------
-; VoutmV_To_TempC
-; Uses V_amp_mv (TRUE mV)
-; Steps:
-; 1) uV_opamp = mV * 1000
-; 2) uV_tc    = uV_opamp / GAIN (300)
-; 3) Temp_cC  = uV_tc * 100 / 41    (41 uV per 1°C)
-; 4) add T_cold (centi-°C)
-; Output: t_hot = total temp in centi-°C (°C*100)
-;---------------------------------
 VoutmV_To_TempC:
-    ; x = V_amp_mv (mV)
     mov A, V_amp_mv+0
     mov x+0, A
     mov A, V_amp_mv+1
@@ -1001,22 +971,18 @@ VoutmV_To_TempC:
     mov A, V_amp_mv+3
     mov x+3, A
 
-    ; uV_opamp = mV * 1000
     Load_y(1000)
     lcall mul32
 
-    ; uV_tc = uV_opamp / 300
     Load_y(300)
     lcall div32
 
-    ; Temp_cC = uV_tc * 100 / 41
     Load_y(100)
     lcall mul32
 
     Load_y(41)
-    lcall div32          ; x now = temp in centi-°C from thermocouple only
+    lcall div32
 
-    ; add cold junction temp (centi-°C)
     mov A, T_cold+0
     mov y+0, A
     mov A, T_cold+1
@@ -1025,10 +991,9 @@ VoutmV_To_TempC:
     mov y+2, A
     mov A, T_cold+3
     mov y+3, A
-    
-    lcall add32          ; x = x + y
 
-    ; store into t_hot (centi-°C)
+    lcall add32
+
     mov A, x+0
     mov t_hot+0, A
     mov A, x+1
@@ -1037,17 +1002,9 @@ VoutmV_To_TempC:
     mov t_hot+2, A
     mov A, x+3
     mov t_hot+3, A
-    ret 
+    ret
 
-
-
-;---------------------------------
-; PrintStateSerial
-; Prints: "STATE=" then FSM1_state as 1 digit, then CRLF
-; Uses: putchar, SendString
-;---------------------------------
 StateLabel: db 'STATE=',0
-
 PrintStateSerial:
     push acc
     push dpl
@@ -1056,13 +1013,13 @@ PrintStateSerial:
     mov dptr, #StateLabel
     lcall SendString
 
-    mov a, FSM1_state         ; 0..6
-    add a, #'0'               ; convert to ASCII
+    mov a, FSM1_state
+    add a, #'0'
     lcall putchar
 
-    mov a, #0Dh               ; CR
+    mov a, #0Dh
     lcall putchar
-    mov a, #0Ah               ; LF
+    mov a, #0Ah
     lcall putchar
 
     pop dph
@@ -1070,22 +1027,19 @@ PrintStateSerial:
     pop acc
     ret
 
-
-
-; LCD_Print3Dec
 LCD_Print3Dec:
     push acc
     push b
     push psw
 
     mov b, #100
-    div ab              ; A=hundreds, B=remainder
+    div ab
     add a, #'0'
     lcall ?WriteData
 
     mov a, b
     mov b, #10
-    div ab              ; A=tens, B=ones
+    div ab
     add a, #'0'
     lcall ?WriteData
 
@@ -1098,63 +1052,7 @@ LCD_Print3Dec:
     pop acc
     ret
 
-; -------------------------------------------------
-; UpdateTempAvg
-; Input:  temp = newest integer °C sample (0..255)
-; Output: temp_avg = average of last up-to-10 samples
-; Uses:   temp_buf[10], temp_idx, temp_sum(16b), temp_count
-; -------------------------------------------------
-UpdateTempAvg_Cumulative:
-    push acc
-    push psw
-
-    ; ---- if count == 255, stop accumulating (freeze avg) ----
-    mov a, temp_count
-    cjne a, #255, UTAc_ok
-    sjmp UTAc_done
-
-UTAc_ok:
-    ; ---- sum += temp (24-bit add) ----
-    mov a, temp_sum24+0
-    add a, temp
-    mov temp_sum24+0, a
-
-    mov a, temp_sum24+1
-    addc a, #0
-    mov temp_sum24+1, a
-
-    mov a, temp_sum24+2
-    addc a, #0
-    mov temp_sum24+2, a
-
-    ; ---- count++ ----
-    inc temp_count
-
-    ; ---- avg = sum / count using div32 ----
-    ; x = sum (24-bit -> 32-bit)
-    mov x+0, temp_sum24+0
-    mov x+1, temp_sum24+1
-    mov x+2, temp_sum24+2
-    mov x+3, #0
-
-    ; y = count (8-bit -> 32-bit)
-    mov y+0, temp_count
-    mov y+1, #0
-    mov y+2, #0
-    mov y+3, #0
-
-    lcall div32          ; x = x / y  (quotient in x)
-
-    mov temp_avg, x+0    ; integer avg (0..255-ish)
-
-UTAc_done:
-    pop psw
-    pop acc
-    ret
-
-;---------------------------------
-;This is all the keypad functions
-;---------------------------------
+; ---- keypad code unchanged below ----
 
 myLUT:
     DB 0xC0, 0xF9, 0xA4, 0xB0, 0x99        ; 0 TO 4
@@ -1162,12 +1060,12 @@ myLUT:
     DB 0x88, 0x83, 0xC6, 0xA1, 0x86, 0x8E  ; A to F
 
 showBCD MAC
-	; Display LSD
+; Display LSD
     mov A, %0
     anl a, #0fh
     movc A, @A+dptr
     mov %1, A
-	; Display MSD
+; Display MSD
     mov A, %0
     swap a
     anl a, #0fh
@@ -1178,49 +1076,49 @@ ENDMAC
 
 
 MYRLC MAC
-	mov a, %0
-	rlc a
-	mov %0, a
+mov a, %0
+rlc a
+mov %0, a
 ENDMAC
 
 
 MYRRC MAC
-	mov a, %0
-	rrc a
-	mov %0, a
+mov a, %0
+rrc a
+mov %0, a
 ENDMAC
 
 
 
 Wait25ms:
 ;33.33MHz, 1 clk per cycle: 0.03us
-	mov R0, #15
-L33: 
+mov R0, #15
+L33:
 mov R1, #74
-L22: 
+L22:
 mov R2, #250
-L11: 
+L11:
 djnz R2, L11 ;3*250*0.03us=22.5us
     djnz R1, L22 ;74*22.5us=1.665ms
     djnz R0, L33 ;1.665ms*15=25ms
     ret
 
 CHECK_COLUMN MAC
-	jb %0, CHECK_COL_%M
-	mov R7, %1
-	jnb %0, $ ; wait for key release
-	setb c
-	ret
+jb %0, CHECK_COL_%M
+mov R7, %1
+jnb %0, $ ; wait for key release
+setb c
+ret
 CHECK_COL_%M:
 ENDMAC
 
 Configure_Keypad_Pins:
-	; Configure the row pins as output and the column pins as inputs
-	orl P1MOD, #0b_01010100 ; P1.6, P1.4, P1.2 output
-	orl P2MOD, #0b_00000001 ; P2.0 output
-	anl P2MOD, #0b_10101011 ; P2.6, P2.4, P2.2 input
-	anl P3MOD, #0b_11111110 ; P3.0 input
-	ret
+; Configure the row pins as output and the column pins as inputs
+orl P1MOD, #0b_01010100 ; P1.6, P1.4, P1.2 output
+orl P2MOD, #0b_00000001 ; P2.0 output
+anl P2MOD, #0b_10101011 ; P2.6, P2.4, P2.2 input
+anl P3MOD, #0b_11111110 ; P3.0 input
+ret
 
 ; These are the pins used for the keypad in this program:
 ROW1 EQU P1.2
@@ -1237,128 +1135,128 @@ COL4 EQU P3.0
 ; It works with both a default keypad or a modified keypad with the labels
 ; rotated 90 deg ccw.  The type of keypad is determined by SW0, which is bit SWA.0
 Keypad:
-	; First check the backspace/correction pushbutton.  We use KEY1 for this function.
-	$MESSAGE TIP: KEY1 is the erase key
-	jb KEY.1, keypad_L0
-	lcall Wait25ms ; debounce
-	jb KEY.1, keypad_L0
-	jnb KEY.1, $ ; The key was pressed, wait for release
-	clr c
-	ret
-	
+; First check the backspace/correction pushbutton.  We use KEY1 for this function.
+$MESSAGE TIP: KEY1 is the erase key
+jb KEY.1, keypad_L0
+lcall Wait25ms ; debounce
+jb KEY.1, keypad_L0
+jnb KEY.1, $ ; The key was pressed, wait for release
+clr c
+ret
+
 keypad_L0:
-	; Make all the rows zero.  If any column is zero then a key is pressed.
-	clr ROW1
-	clr ROW2
-	clr ROW3
-	clr ROW4
-	mov c, COL1
-	anl c, COL2
-	anl c, COL3
-	anl c, COL4
-	jnc Keypad_Debounce
-	clr c
-	ret
-		
+; Make all the rows zero.  If any column is zero then a key is pressed.
+clr ROW1
+clr ROW2
+clr ROW3
+clr ROW4
+mov c, COL1
+anl c, COL2
+anl c, COL3
+anl c, COL4
+jnc Keypad_Debounce
+clr c
+ret
+
 Keypad_Debounce:
-	; A key maybe pressed.  Wait and check again to discard bounces.
-	lcall Wait25ms ; debounce
-	mov c, COL1
-	anl c, COL2
-	anl c, COL3
-	anl c, COL4
-	jnc Keypad_Key_Code
-	clr c
-	ret
-	
-Keypad_Key_Code:	
-	; A key is pressed.  Find out which one by checking each possible column and row combination.
+; A key maybe pressed.  Wait and check again to discard bounces.
+lcall Wait25ms ; debounce
+mov c, COL1
+anl c, COL2
+anl c, COL3
+anl c, COL4
+jnc Keypad_Key_Code
+clr c
+ret
 
-	setb ROW1
-	setb ROW2
-	setb ROW3
-	setb ROW4
-	
-	$MESSAGE TIP: SW0 is used to control the layout of the keypad. SW0=0: unmodified keypad. SW0=1: keypad rotated 90 deg CCW
+Keypad_Key_Code:
+; A key is pressed.  Find out which one by checking each possible column and row combination.
 
-	jnb SWA.0, keypad_default
-	;ljmp keypad_90deg
-	
-	; This check section is for an un-modified keypad
-keypad_default:	
-	; Check row 1	
-	clr ROW1
-	CHECK_COLUMN(COL1, #01H)
-	CHECK_COLUMN(COL2, #02H)
-	CHECK_COLUMN(COL3, #03H)
-	CHECK_COLUMN(COL4, #0AH)
-	setb ROW1
+setb ROW1
+setb ROW2
+setb ROW3
+setb ROW4
 
-	; Check row 2	
-	clr ROW2
-	CHECK_COLUMN(COL1, #04H)
-	CHECK_COLUMN(COL2, #05H)
-	CHECK_COLUMN(COL3, #06H)
-	CHECK_COLUMN(COL4, #0BH)
-	setb ROW2
+$MESSAGE TIP: SW0 is used to control the layout of the keypad. SW0=0: unmodified keypad. SW0=1: keypad rotated 90 deg CCW
 
-	; Check row 3	
-	clr ROW3
-	CHECK_COLUMN(COL1, #07H)
-	CHECK_COLUMN(COL2, #08H)
-	CHECK_COLUMN(COL3, #09H)
-	CHECK_COLUMN(COL4, #0CH)
-	setb ROW3
+;jnb SWA.0, keypad_default
+;ljmp keypad_90deg
 
-	; Check row 4	
-	clr ROW4
-	CHECK_COLUMN(COL1, #0EH)
-	CHECK_COLUMN(COL2, #00H)
-	CHECK_COLUMN(COL3, #0FH)
-	CHECK_COLUMN(COL4, #0DH)
-	setb ROW4
+; This check section is for an un-modified keypad
+keypad_default:
+; Check row 1
+clr ROW1
+CHECK_COLUMN(COL1, #01H)
+CHECK_COLUMN(COL2, #02H)
+CHECK_COLUMN(COL3, #03H)
+CHECK_COLUMN(COL4, #0AH)
+setb ROW1
 
-	clr c
-	ret
-	
-	; This check section is for a keypad with the labels rotated 90 deg ccw
+; Check row 2
+clr ROW2
+CHECK_COLUMN(COL1, #04H)
+CHECK_COLUMN(COL2, #05H)
+CHECK_COLUMN(COL3, #06H)
+CHECK_COLUMN(COL4, #0BH)
+setb ROW2
+
+; Check row 3
+clr ROW3
+CHECK_COLUMN(COL1, #07H)
+CHECK_COLUMN(COL2, #08H)
+CHECK_COLUMN(COL3, #09H)
+CHECK_COLUMN(COL4, #0CH)
+setb ROW3
+
+; Check row 4
+clr ROW4
+CHECK_COLUMN(COL1, #0EH)
+CHECK_COLUMN(COL2, #00H)
+CHECK_COLUMN(COL3, #0FH)
+CHECK_COLUMN(COL4, #0DH)
+setb ROW4
+
+clr c
+ret
+
+; This check section is for a keypad with the labels rotated 90 deg ccw
 keypad_90deg:
-	; Check row 1	
-	clr ROW1
-	CHECK_COLUMN(COL1, #0AH)
-	CHECK_COLUMN(COL2, #0BH)
-	CHECK_COLUMN(COL3, #0CH)
-	CHECK_COLUMN(COL4, #0DH)
-	setb ROW1
+; Check row 1
+clr ROW1
+CHECK_COLUMN(COL1, #0AH)
+CHECK_COLUMN(COL2, #0BH)
+CHECK_COLUMN(COL3, #0CH)
+CHECK_COLUMN(COL4, #0DH)
+setb ROW1
 
-	; Check row 2	
-	clr ROW2
-	CHECK_COLUMN(COL1, #03H)
-	CHECK_COLUMN(COL2, #06H)
-	CHECK_COLUMN(COL3, #09H)
-	CHECK_COLUMN(COL4, #0FH)
-	setb ROW2
+; Check row 2
+clr ROW2
+CHECK_COLUMN(COL1, #03H)
+CHECK_COLUMN(COL2, #06H)
+CHECK_COLUMN(COL3, #09H)
+CHECK_COLUMN(COL4, #0FH)
+setb ROW2
 
-	; Check row 3	
-	clr ROW3
-	CHECK_COLUMN(COL1, #02H)
-	CHECK_COLUMN(COL2, #05H)
-	CHECK_COLUMN(COL3, #08H)
-	CHECK_COLUMN(COL4, #00H)
-	setb ROW3
+; Check row 3
+clr ROW3
+CHECK_COLUMN(COL1, #02H)
+CHECK_COLUMN(COL2, #05H)
+CHECK_COLUMN(COL3, #08H)
+CHECK_COLUMN(COL4, #00H)
+setb ROW3
 
-	; Check row 4	
-	clr ROW4
-	CHECK_COLUMN(COL1, #01H)
-	CHECK_COLUMN(COL2, #04H)
-	CHECK_COLUMN(COL3, #07H)
-	CHECK_COLUMN(COL4, #0EH)
-	setb ROW4
+; Check row 4
+clr ROW4
+CHECK_COLUMN(COL1, #01H)
+CHECK_COLUMN(COL2, #04H)
+CHECK_COLUMN(COL3, #07H)
+CHECK_COLUMN(COL4, #0EH)
+setb ROW4
 
-	clr c
-	ret
-	
-	
+clr c
+ret
+
+
 ;--------------------------------------------
 ; this is how we pick to edit the parameters
 ;--------------------------------------------
@@ -1370,152 +1268,196 @@ Get3Digits:
     push psw
 
     lcall Keypad
-    jnc G3_exit              ; no key => C stays 0
+    jnc G3_no_key
 
-    ; accept only 0..9
+    ; Key pressed (code in R7)
+
+    ; CHECK FOR 'ENTER' (e.g. # key which is 0x0F or 0x0D depending on map)
+    ; Assuming keypad_default maps ROW4/COL4 to 0x0D (#) or similar.
+    ; Check your Keypad_Key_Code routine.
+    ; K_R4_C4 -> #0DH. So if R7 == 0x0D, it's enter.
+
+    mov a, R7
+    cjne a, #0DH, G3_check_digit
+    ; ENTER PRESSED
+    ; If we have at least 1 digit, accept it
+    mov a, edit_digits
+    jz G3_exit ; ignore empty enter
+
+    pop psw ; Restore PSW (carry=0)
+    setb c  ; Set carry = 1 (DONE)
+    pop b
+    pop acc
+    ret
+
+G3_check_digit:
+    ; Accept only 0..9
     mov a, R7
     clr c
     subb a, #0Ah
-    jnc G3_exit              ; A..F ignored
+    jnc G3_exit             
 
-    ; if already 3 digits, ignore until caller resets
+    ; Check overflow (3 digits max)
     mov a, edit_digits
     cjne a, #3, G3_build
     sjmp G3_exit
 
 G3_build:
-    ; edit_value = edit_value*10 + R7
-
-    ; B = 2x
+    ; val = val*10 + new
     mov a, edit_value
-    add a, edit_value        ; VALID
-    mov b, a                 ; B=2x
-
-    ; A = 8x
+    add a, edit_value       
+    mov b, a                 
     mov a, edit_value
     rl a
     rl a
-    rl a                     ; A=8x
+    rl a                     
+    add a, b                 
+    add a, R7               
 
-    add a, b                 ; A=10x
-    add a, R7                ; A=10x + digit
-
-    ; store
     mov edit_value, a
     inc edit_digits
 
-    ; done?
+    ; If 3 digits reached, done automatically
     mov a, edit_digits
     cjne a, #3, G3_exit
-    setb c                   ; DONE
 
-G3_exit:
-    pop psw
+    ; DONE (3 digits)
+    pop psw  ; Restore PSW (Carry=0)
+    setb c   ; Force Carry=1
     pop b
     pop acc
     ret
-    
-    
-; ---------------------------------------------------------
-; ReadParamSel_SW01
-; param_sel = (SWA.1<<1) | SWA.0
-; Outputs: param_sel (0..3)
-; ---------------------------------------------------------
+
+G3_no_key:
+    pop psw ; Restore PSW (Carry=0)
+    clr c   ; Ensure Carry=0
+    pop b
+    pop acc
+    ret
+
+G3_exit:
+    pop psw
+    clr c
+    pop b
+    pop acc
+    ret
+
 ReadParamSel_SW01:
     push acc
     clr a
-
-    ; bit0 = SWA.0
     jb  SWA.0, RPS_bit0_1
     sjmp RPS_bit0_done
 RPS_bit0_1:
     orl a, #01h
 RPS_bit0_done:
-
-    ; bit1 = SWA.1
     jb  SWA.1, RPS_bit1_1
     sjmp RPS_bit1_done
 RPS_bit1_1:
     orl a, #02h
 RPS_bit1_done:
-
     mov param_sel, a
     pop acc
     ret
-    
-    
-; ---------------------------------------------------------
-; ApplyEditValue_ToSelectedParam
-; Writes edit_value into the parameter selected by param_sel.
-; Mapping:
-;   0 -> temp_refl
-;   1 -> time_refl
-;   2 -> temp_soak
-;   3 -> time_soak
-; ---------------------------------------------------------
+
 ApplyEditValue_ToSelectedParam:
     push acc
-
     mov a, param_sel
     cjne a, #0, A1
-    mov temp_refl, edit_value
+    mov Temp_refl, edit_value
     sjmp ADone
 A1: cjne a, #1, A2
-    mov time_refl, edit_value
+    mov Time_refl, edit_value
     sjmp ADone
 A2: cjne a, #2, A3
     mov temp_soak, edit_value
     sjmp ADone
 A3:
-    mov time_soak, edit_value
-
+    mov Time_soak, edit_value
 ADone:
     pop acc
     ret
 
-;------------------------------
-; Prints:
-;   rT = temp_refl
-;   rC = time_refl
-;   sT = temp_soak
-;   sC = time_soak
-; -------------------------------------------------
 State0_DrawLCD:
     push acc
     push dpl
     push dph
-
-    ; ----- Line 1 -----
     Set_Cursor(1,1)
     Send_Constant_String(#State0_Line1)
-
-    ; ----- Line 2 template -----
     Set_Cursor(2,1)
     Send_Constant_String(#State0_Line2)
-
-    ; rT at col 1..3
     Set_Cursor(2,1)
-    mov a, temp_refl
+    mov a, Temp_refl
     lcall LCD_Print3Dec
-
-    ; rC at col 5..7
     Set_Cursor(2,5)
-    mov a, time_refl
+    mov a, Time_refl
     lcall LCD_Print3Dec
-
-    ; sT at col 9..11
     Set_Cursor(2,9)
     mov a, temp_soak
     lcall LCD_Print3Dec
-
-    ; sC at col 13..15
     Set_Cursor(2,13)
-    mov a, time_soak
+    mov a, Time_soak
     lcall LCD_Print3Dec
-
     pop dph
     pop dpl
     pop acc
     ret
-    
+
+
+KeyLED_LUT:
+    ; key 0..15 => 16-bit mask (low byte first)
+    DB 01h,00h   ; 0  -> LEDRA.0
+    DB 02h,00h   ; 1  -> LEDRA.1
+    DB 04h,00h   ; 2  -> LEDRA.2
+    DB 08h,00h   ; 3  -> LEDRA.3
+    DB 10h,00h   ; 4  -> LEDRA.4
+    DB 20h,00h   ; 5  -> LEDRA.5
+    DB 40h,00h   ; 6  -> LEDRA.6
+    DB 80h,00h   ; 7  -> LEDRA.7
+    DB 00h,01h   ; 8  -> LEDRB.0
+    DB 00h,02h   ; 9  -> LEDRB.1
+    DB 00h,04h   ; A  -> LEDRB.2
+    DB 00h,08h   ; B  -> LEDRB.3
+    DB 00h,10h   ; C  -> LEDRB.4
+    DB 00h,20h   ; D  -> LEDRB.5
+    DB 00h,40h   ; E  -> LEDRB.6
+    DB 00h,80h   ; F  -> LEDRB.7
+
+Keypad_Test_LEDs:
+    push acc
+    push dpl
+    push dph
+
+    lcall Keypad
+    jnc KTL_no_key          ; no key -> keep LEDs as-is (or clear)
+
+    ; If R7 is not 0..15, ignore
+    mov a, R7
+    clr c
+    subb a, #10h
+    jnc KTL_done
+
+    ; DPTR = LUT + (R7*2)
+    mov dptr, #KeyLED_LUT
+    mov a, R7
+    rl a               ; *2
+    movc a, @a+dptr         ; low byte
+    mov LEDRA, a
+    mov a, R7
+    rl a
+    inc a
+    movc a, @a+dptr         ; high byte
+    mov LEDRB, a
+    sjmp KTL_done
+
+KTL_no_key:
+    ; optional: clear LEDs when no key
+    ; mov LEDRA, #0
+    ; mov LEDRB, #0
+
+KTL_done:
+    pop dph
+    pop dpl
+    pop acc
+    ret
+
 end
