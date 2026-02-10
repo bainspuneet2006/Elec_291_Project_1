@@ -506,7 +506,7 @@ FSM1_state1:
     subb a, #50
     jc  temp_below_50
     setb Reached50_flag
-;error when it goes to state 0 make sure ot check it later 
+
 temp_below_50:
     mov a, sec
     clr c
@@ -711,7 +711,7 @@ FSM2_NoReset:
 Set_Cursor(1,7)
     lcall Display_TempC_7seg
     lcall send_temp_serial
-    ;lcall PrintStateSerial
+    lcall PrintStateSerial
 
 	loop_b:
     clr half_seconds_flag
@@ -955,7 +955,6 @@ ret
 Read_Ref:
     mov a, #00h
     lcall Read_ADC
-    lcall Read_ADC
     mov VAL_LM4040+0, R0
     mov VAL_LM4040+1, R1
     ret
@@ -974,14 +973,13 @@ Read_op_amp_mv:
 _ref_ok:
     mov a, #01h
     lcall Read_ADC
-    lcall Read_ADC
 
     mov x+0, R0
     mov x+1, R1
     mov x+2, #00h
     mov x+3, #00h
 
-    Load_y(4096)
+    Load_y(4103)
     lcall mul32
 
     mov y+0, VAL_LM4040+0
@@ -998,61 +996,19 @@ _ref_ok:
     ret
 
 VoutmV_To_TempC:
- 	
- 	
- 	
- 	clr a 
- 	mov t_hot+0, a
- 	mov t_hot+1, a
- 	mov t_hot+2, a
- 	mov t_hot+3, a
- 	mov R3, #20
- 	
- loop_temp: 
- 
- 	lcall Read_op_amp_mv
- 	
- 	mov x+0, t_hot+0
- 	mov x+1, t_hot+1
- 	mov x+2, t_hot+2
- 	mov x+3, t_hot+3
- 	
     mov A, V_amp_mv+0
-    mov y+0, A
+    mov x+0, A
     mov A, V_amp_mv+1
-    mov y+1, A
+    mov x+1, A
     mov A, V_amp_mv+2
-    mov y+2, A
+    mov x+2, A
     mov A, V_amp_mv+3
-    mov y+3, A
-    
-    
-    
-    lcall add32
-    
-    mov t_hot+0, x+0
-    mov t_hot+1, x+1
-    mov t_hot+2, x+2
-    mov t_hot+3, x+3
-    
-    djnz R3, loop_temp
-    
-    
-average_val:
+    mov x+3, A
 
-
-	mov x+0, t_hot+0
-	mov x+1, t_hot+1
-	mov x+2, t_hot+2
-	mov x+3, t_hot+3
-
-	load_y(20)
-	lcall div32
-	
     Load_y(1000)
     lcall mul32
 
-    Load_y(315)
+    Load_y(300)
     lcall div32
 
     Load_y(100)
