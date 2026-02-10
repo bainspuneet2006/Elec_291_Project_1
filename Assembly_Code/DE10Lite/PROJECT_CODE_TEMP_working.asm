@@ -1052,7 +1052,7 @@ average_val:
     Load_y(1000)
     lcall mul32
 
-    Load_y(315)
+    Load_y(306)
     lcall div32
 
     Load_y(100)
