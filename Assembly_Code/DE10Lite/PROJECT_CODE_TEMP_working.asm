@@ -27,6 +27,7 @@ SOUND_OUT     equ P1.5
 UPDOWN        equ SWA.0
 Play_beeps_Switch equ SWA.4
 Start_Switch equ SWA.2
+Abort_switch equ SWA.7
 
 ; RESET BUTTON (NEW)
 RESET_BTN     equ KEY.0
@@ -122,8 +123,8 @@ orl a, #0x01
 mov TMOD, a
 mov TH0, #high(TIMER0_RELOAD)
 mov TL0, #low(TIMER0_RELOAD)
-    setb ET0
-    clr TR0
+setb ET0
+clr TR0
 ret
 
 Timer0_ISR:
@@ -455,7 +456,7 @@ FSM_state0:
 cjne a, #0, FSM1_state1
 mov pwm, #0
 
- mov a, edit_digits
+mov a, edit_digits
 jnz S0_sel_same
 
 lcall ReadParamSel_SW01
@@ -481,20 +482,24 @@ S0_sel_same:
     mov edit_digits, #0
 
 S0_not_ready:
-  lcall State0_DrawLCD
+  	lcall State0_DrawLCD
 
 	jb Start_Switch, FSM1_state0_done
-	lcall playSingle_beep
 	mov sec, #0
 	clr Reached50_flag
 	mov FSM1_state, #1
+	lcall playSingle_beep
 
 FSM1_state0_done:
 	ljmp FSM2
 
+
+; state 1 ramping to soak
 FSM1_state1:
 	cjne a, #1, FSM1_state2
 	mov pwm, #100
+	;abort button check 
+	jb Abort_switch , error_found_jump
 
     mov a, temp
     clr c
@@ -526,8 +531,12 @@ continue_preheat:
 FSM1_state1_done:
 ljmp FSM2
 
+error_found_jump: 
+sjmp error_found
+
 FSM1_state2:
 cjne a, #2, FSM1_state3
+jb Abort_switch, error_found
 mov pwm, #20
 mov a, time_soak
 clr c
@@ -542,6 +551,7 @@ ljmp FSM2
 
 FSM1_state3:
 cjne a, #3, FSM1_state4
+jb Abort_switch, error_found
 mov pwm, #100
 mov a, temp_refl
 clr c
@@ -556,6 +566,7 @@ ljmp FSM2
 
 FSM1_state4:
 cjne a, #4, FSM1_state5
+jb Abort_switch, error_found
 mov pwm, #20
 mov a, time_refl
 clr c
@@ -580,6 +591,19 @@ mov FSM1_state, #0
 FSM_state5_done:
 ljmp FSM2
 
+
+
+error_found: 
+sjmp trigger_error
+
+
+trigger_error: 
+mov FSM1_state, #5
+mov pwm , #0
+lcall ten_beeps
+ljmp FSM2
+
+; error check
 FSM1_state6:
     cjne a, #6, not_error
     sjmp is_error
@@ -823,14 +847,24 @@ PrintU32:
 
 playSingle_beep:
 mov beep_count, #1
+clr a
+mov Count1ms+0, a
+mov Count1ms+1, a
 ret
 
 ten_beeps:
 mov beep_count, #10
+clr a
+mov Count1ms+0, a
+mov Count1ms+1, a
+
 ret
 
 five_beeps:
 mov beep_count, #5
+clr a
+mov Count1ms+0, a
+mov Count1ms+1, a
 ret
 
 PU32_go:
