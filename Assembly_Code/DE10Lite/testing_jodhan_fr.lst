@@ -1,0 +1,2460 @@
+0000              1   ; ISR_example_DE10Lite.asm:
+0000              2   ; a) Increments/decrements a BCD variable every half second using
+0000              3   ;    an ISR for timer 2.  Uses SW0 to decide.  Also 'blinks' LEDR0 every
+0000              4   ;    half second.
+0000              5   ; b) Generates a 2kHz square wave at pin P1.5 using an ISR for timer 0.
+0000              6   ; c) In the 'main' loop it displays the variable incremented/decremented
+0000              7   ;    using the ISR for timer 2 on the LCD and the 7-segment displays.
+0000              8   ;    Also resets it to zero if the KEY1 pushbutton  is pressed.
+0000              9   ; d) Controls the LCD using general purpose pins P2.3, P2.5, P2.7, P3.1, P3.3, P3.5, P3.7
+0000             10   ;
+0000             11   ; ADDITIONS YOU ASKED FOR:
+0000             12   ;   8) Total elapsed time (seconds) displayed on LCD in all states except 0,
+0000             13   ;      maintained by Timer2 ISR, resets when returning to state 0.
+0000             14   ;   9) Reset button (KEY0) forces state 0 and resets everything.
+0000             15   ;
+0000             16   ; NEW ADDITION (ACCELEROMETER TILT ABORT):
+0000             17   ;   Uses the DE10-Lite onboard ADXL345 accelerometer. If board tilts too much
+0000             18   ;   (|X| or |Y| exceeds threshold), aborts process by forcing state 6, turning
+0000             19   ;   heater off, and sounding ten beeps.
+0000             20   
+                 22   $LIST
+0000             24   
+0000             25   CLK           EQU 33333333
+0000             26   TIMER0_RATE   EQU 4096
+0000             27   TIMER0_RELOAD EQU ((65536-(CLK/(12*TIMER0_RATE))))
+0000             28   TIMER2_RATE   EQU 1000
+0000             29   TIMER2_RELOAD EQU ((65536-(CLK/(12*TIMER2_RATE))))
+0000             30   
+0000             31   SOUND_OUT     equ P1.5
+0000             32   UPDOWN        equ SWA.0
+0000             33   Play_beeps_Switch equ SWA.4
+0000             34   Start_Switch equ SWA.2
+0000             35   Abort_switch equ SWA.7
+0000             36   
+0000             37   ; RESET BUTTON (NEW)
+0000             38   RESET_BTN     equ KEY.0
+0000             39   
+0000             40   SSR_PIN equ P3.7
+0000             41   
+0000             42   ; ==============================
+0000             43   ; ADXL345 (DE10-Lite onboard) SPI pins
+0000             44   ; ==============================
+0000             45   GSENSOR_SDI  BIT 0xfd ; MOSI
+0000             46   GSENSOR_SDO  BIT 0xfd ; MISO
+0000             47   GSENSOR_SCLK BIT 0xfe
+0000             48   GSENSOR_CS_n BIT 0xff
+0000             49   
+0000             50   ; Tilt threshold (16-bit). Tune this for demo.
+0000             51   ; Start at 0x0600. If too sensitive -> 0x0800. If not sensitive -> 0x0400.
+0000             52   TILT_TH_HI  EQU 00h
+0000             53   TILT_TH_LO  EQU 0C0h
+0000             54   
+0000             55   BAUD            EQU 57600
+0000             56   TIMER_1_RELOAD  EQU (256-((2*CLK)/(12*32*BAUD)))
+0000             57   
+0000             58   org 0x0000
+0000 020782      59       ljmp main
+0003             60   
+0003             61   org 0x0003
+0003 32          62   reti
+0004             63   
+000B             64   org 0x000B
+000B 0203E3      65   ljmp Timer0_ISR
+000E             66   
+0013             67   org 0x0013
+0013 32          68   reti
+0014             69   
+001B             70   org 0x001B
+001B 32          71   reti
+001C             72   
+0023             73   org 0x0023
+0023 32          74   reti
+0024             75   
+002B             76   org 0x002B
+002B 02040D      77   ljmp Timer2_ISR
+002E             78   
+0030             79   dseg at 0x30
+0030             80   Count1ms:     ds 2
+0032             81   count_ms:     ds 2
+0034             82   
+0034             83   BCD_counter:  ds 1
+0035             84   beep_count:   ds 1
+0036             85   beep_state:   ds 1
+0037             86   FSM1_state:   ds 1
+0038             87   temp_soak:    ds 1
+0039             88   Time_soak:    ds 1
+003A             89   Temp_refl:    ds 1
+003B             90   Time_refl:    ds 1
+003C             91   pwm_counter:  ds 1
+003D             92   pwm:          ds 1
+003E             93   temp:         ds 1
+003F             94   sec:          ds 1
+0040             95   
+0040             96   ;LCD FUNCTION
+0040             97   last_lcd_state: ds 1
+0041             98   
+0041             99   ; NEW: total elapsed time since leaving state0
+0041            100   elapsed_sec:  ds 2   ; 16-bit seconds, displayed as 4 digits (0000..9999)
+0043            101   
+0043            102   x : ds 4
+0047            103   y : ds 4
+004B            104   bcd : ds 5
+0050            105   
+0050            106   V_amp_mv: ds 4
+0054            107   T_cold: ds 4
+0058            108   t_hot : ds 4
+005C            109   VAL_LM4040: ds 2
+005E            110   
+005E            111   param_sel:     ds 1
+005F            112   edit_value:    ds 1
+0060            113   edit_digits:   ds 1
+0061            114   prev_sel:      ds 1
+0062            115   
+0062            116   ; ==============================
+0062            117   ; ADXL345 raw readings + tilt flag
+0062            118   ; ==============================
+0062            119   ax_l: ds 1
+0063            120   ax_h: ds 1
+0064            121   ay_l: ds 1
+0065            122   ay_h: ds 1
+0066            123   az_l: ds 1
+0067            124   az_h: ds 1
+0068            125   tilt_fault: ds 1
+0069            126   
+0000            127   bseg
+0000            128   half_seconds_flag: dbit 1
+0001            129   mf : dbit 1
+0002            130   Reached50_flag: dbit 1
+0003            131   
+002E            132   cseg
+002E            133   ELCD_RS equ P1.7
+002E            134   ELCD_E  equ P1.1
+002E            135   ELCD_D4 equ P0.7
+002E            136   ELCD_D5 equ P0.5
+002E            137   ELCD_D6 equ P0.3
+002E            138   ELCD_D7 equ P0.1
+002E            139   
+002E 0D0A4865   140   InitialString: db '\r\nHello, World!\r\n', 0
+     6C6C6F2C
+     20576F72
+     6C64210D
+     0A00
+                546   $LIST
+                143   $LIST
+0367            145   
+0367 54656D70   146   Initial_Message:  db 'TempC= xx ', 0
+     433D2078
+     782000
+0372            147   
+0372 73432020   148   State0_Line1: db 'sC  sT  rC  rT',0
+     73542020
+     72432020
+     725400
+0381 00         149   State0_Line2: db '',0
+0382            150   
+0382            151   ;LCD FUNCTION
+0382 53312050   152   State1_Line1: db 'S1 PREHEAT  ', 0
+     52454845
+     41542020
+     00
+038F 53322053   153   State2_Line1: db 'S2 SOAK     ', 0
+     4F414B20
+     20202020
+     00
+039C 53332052   154   State3_Line1: db 'S3 REFLOW   ', 0
+     45464C4F
+     57202020
+     00
+03A9 53342048   155   State4_Line1: db 'S4 HOLD     ', 0
+     4F4C4420
+     20202020
+     00
+03B6 53352043   156   State5_Line1: db 'S5 COOL     ', 0
+     4F4F4C20
+     20202020
+     00
+03C3 53362045   157   State6_Line1: db 'S6 ERROR    ', 0
+     52524F52
+     20202020
+     00
+03D0            158   
+03D0            159   Timer0_Init:
+03D0 E589       160   mov a, TMOD
+03D2 54F0       161   anl a, #0xf0
+03D4 4401       162   orl a, #0x01
+03D6 F589       163   mov TMOD, a
+03D8 758CFD     164   mov TH0, #high(TIMER0_RELOAD)
+03DB 758A5A     165   mov TL0, #low(TIMER0_RELOAD)
+03DE D2A9       166   setb ET0
+03E0 C28C       167   clr TR0
+03E2 22         168   ret
+03E3            169   
+03E3            170   Timer0_ISR:
+03E3 758CFD     171   mov TH0, #high(TIMER0_RELOAD)
+03E6 758A5A     172   mov TL0, #low(TIMER0_RELOAD)
+03E9 B295       173   cpl SOUND_OUT
+03EB 32         174   reti
+03EC            175   
+03EC            176   Timer2_Init:
+03EC 75C800     177   mov T2CON, #0
+03EF 75CDF5     178   mov TH2, #high(TIMER2_RELOAD)
+03F2 75CC27     179   mov TL2, #low(TIMER2_RELOAD)
+03F5 75CBF5     180   mov RCAP2H, #high(TIMER2_RELOAD)
+03F8 75CA27     181   mov RCAP2L, #low(TIMER2_RELOAD)
+03FB            182   
+03FB E4         183   clr a
+03FC F530       184   mov Count1ms+0, a
+03FE F531       185   mov Count1ms+1, a
+0400 F532       186   mov count_ms+0, a
+0402 F533       187   mov count_ms+1, a
+0404            188   
+0404            189   ; NEW
+0404 F541       190   mov elapsed_sec+0, a
+0406 F542       191   mov elapsed_sec+1, a
+0408            192   
+0408 D2AD       193       setb ET2
+040A D2CA       194       setb TR2
+040C 22         195   ret
+040D            196   
+040D            197   ; ==========================================================
+040D            198   ; Timer2 ISR: PWM + ms tick + sec tick + total elapsed time
+040D            199   ; ==========================================================
+040D            200   Timer2_ISR:
+040D C2CF       201       clr TF2
+040F C0E0       202       push acc
+0411 C0D0       203       push psw
+0413 C0F0       204       push b
+0415 C082       205       push dpl
+0417 C083       206       push dph
+0419            207   
+0419            208       ; --- PWM LOGIC ---
+0419 053C       209       inc pwm_counter
+041B E53C       210       mov a, pwm_counter
+041D B46403     211       cjne a, #100, do_pwm_check
+0420 753C00     212       mov pwm_counter, #0
+0423            213   
+0423            214   do_pwm_check:
+0423 C3         215       clr c
+0424 E53C       216       mov a, pwm_counter
+0426 953D       217       subb a, pwm
+0428 4004       218       jc turn_ssr_on
+042A            219   
+042A            220   turn_ssr_off:
+042A C2B7       221       clr SSR_PIN
+042C 8002       222       sjmp pwm_done
+042E            223   
+042E            224   turn_ssr_on:
+042E D2B7       225       setb SSR_PIN
+0430            226   
+0430            227   pwm_done:
+0430            228       ; --- TIME KEEPING (ms counters) ---
+0430 0530       229       inc Count1ms+0
+0432 E530       230       mov a, Count1ms+0
+0434 7002       231       jnz Inc_High
+0436 0531       232       inc Count1ms+1
+0438            233   Inc_High:
+0438            234   
+0438 0532       235       inc count_ms+0
+043A E532       236       mov a, count_ms+0
+043C 7002       237       jnz Inc_High_2
+043E 0533       238       inc count_ms+1
+0440            239   Inc_High_2:
+0440            240   
+0440            241       ; ---- 1 second tick ----
+0440 E532       242       mov a, count_ms+0
+0442 B4E82D     243       cjne a, #low(1000), Check_500ms
+0445 E533       244       mov a, count_ms+1
+0447 B40328     245       cjne a, #high(1000), Check_500ms
+044A            246   
+044A            247       ; 1 second passed: update sec (your per-state timer)
+044A 053F       248       inc sec
+044C E4         249       clr a
+044D F532       250       mov count_ms+0, a
+044F F533       251       mov count_ms+1, a
+0451            252   
+0451            253       ; NEW: total elapsed seconds since leaving state0
+0451 E537       254       mov a, FSM1_state
+0453 6016       255       jz Elapsed_Reset_In_ISR
+0455            256   
+0455            257       ; if elapsed_sec = 999, saturate
+0455 E542       258       mov a, elapsed_sec+1
+0457 B40307     259       cjne a, #high(999), Elapsed_Not_MaxHi
+045A E541       260       mov a, elapsed_sec+0
+045C B4E702     261       cjne a, #low(999), Elapsed_Not_MaxHi
+045F 8011       262       sjmp Check_500ms
+0461            263   
+0461            264   Elapsed_Not_MaxHi:
+0461 0541       265       inc elapsed_sec+0
+0463 E541       266       mov a, elapsed_sec+0
+0465 700B       267       jnz Check_500ms
+0467 0542       268       inc elapsed_sec+1
+0469 8007       269       sjmp Check_500ms
+046B            270   
+046B            271   Elapsed_Reset_In_ISR:
+046B E4         272       clr a
+046C F541       273       mov elapsed_sec+0, a
+046E F542       274       mov elapsed_sec+1, a
+0470 F53F       275       mov sec, a
+0472            276   
+0472            277   Check_500ms:
+0472 E530       278       mov a, Count1ms+0
+0474 B4F414     279       cjne a, #low(500), beep_logic
+0477 E531       280       mov a, Count1ms+1
+0479 B4010F     281       cjne a, #high(500), beep_logic
+047C            282   
+047C E4         283       clr a
+047D F530       284       mov Count1ms+0, a
+047F F531       285       mov Count1ms+1, a
+0481 D200       286       setb half_seconds_flag
+0483 B2E8       287       cpl LEDRA.0
+0485            288   
+0485            289       ; --- BEEP LOGIC ---
+0485 E535       290       mov a, beep_count
+0487 6002       291       jz beep_logic
+0489            292   
+0489 1535       293       dec beep_count
+048B            294   
+048B            295   beep_logic:
+048B E535       296       mov a, beep_count
+048D 6011       297       jz stop_beeping
+048F            298   
+048F E531       299       mov a, Count1ms+1
+0491 700D       300       jnz stop_beeping
+0493 E530       301       mov a, Count1ms+0
+0495 B46402     302       cjne a, #100, check_less
+0498 8006       303       sjmp stop_beeping
+049A            304   
+049A            305   check_less:
+049A 5004       306       jnc stop_beeping
+049C            307   
+049C            308   turn_beep_on_logic:
+049C D28C       309       setb TR0
+049E 8004       310       sjmp beep_logic_done
+04A0            311   
+04A0            312   stop_beeping:
+04A0 C28C       313       clr TR0
+04A2 C295       314       clr SOUND_OUT
+04A4            315   
+04A4            316   beep_logic_done:
+04A4            317       ; --- BCD COUNTER ---
+04A4 E534       318       mov a, BCD_counter
+04A6 20E807     319       jb UPDOWN, Timer2_ISR_decrement
+04A9 2401       320       add a, #0x01
+04AB D4         321       da a
+04AC F534       322       mov BCD_counter, a
+04AE 8005       323       sjmp Timer2_ISR_done_jump
+04B0            324   
+04B0            325   Timer2_ISR_decrement:
+04B0 2499       326       add a, #0x99
+04B2 D4         327       da a
+04B3 F534       328       mov BCD_counter, a
+04B5            329   
+04B5            330   Timer2_ISR_done_jump:
+04B5 D083       331       pop dph
+04B7 D082       332       pop dpl
+04B9 D0F0       333       pop b
+04BB D0D0       334       pop psw
+04BD D0E0       335       pop acc
+04BF 32         336       reti
+04C0            337   
+04C0            338   T_7seg:
+04C0 C0F9A4B0   339       DB 0xC0, 0xF9, 0xA4, 0xB0, 0x99
+     99
+04C5 9282F880   340       DB 0x92, 0x82, 0xF8, 0x80, 0x90
+     90
+04CA 8883C6A1   341       DB 0x88, 0x83, 0xC6, 0xA1, 0x86, 0x8E
+     868E
+04D0            342   
+04D0            343   ; ==========================================================
+04D0            344   ; NEW: Force reset to state0 and clear everything
+04D0            345   ; ==========================================================
+04D0            346   Force_Reset_To_State0:
+04D0 C0E0       347       push acc
+04D2            348   
+04D2 753D00     349       mov pwm, #0
+04D5 C2B7       350       clr SSR_PIN
+04D7            351   
+04D7 753700     352       mov FSM1_state, #0
+04DA            353   
+04DA E4         354       clr a
+04DB F53F       355       mov sec, a
+04DD F541       356       mov elapsed_sec+0, a
+04DF F542       357       mov elapsed_sec+1, a
+04E1            358   
+04E1 F535       359       mov beep_count, a
+04E3 C28C       360       clr TR0
+04E5 C295       361       clr SOUND_OUT
+04E7            362   
+04E7 C202       363       clr Reached50_flag
+04E9            364   
+04E9 D0E0       365       pop acc
+04EB 22         366       ret
+04EC            367   
+04EC            368   ; ==========================================================
+04EC            369   ; NEW: Show elapsed time on LCD (row1 col13..16) if state != 0
+04EC            370   ; Displays elapsed seconds as 4 digits, saturates at 9999.
+04EC            371   ; ==========================================================
+04EC            372   Display_Elapsed_LCD:
+04EC C0E0       373       push acc
+04EE C0F0       374       push b
+04F0 C0D0       375       push psw
+04F2 C082       376       push dpl
+04F4 C083       377       push dph
+04F6            378      
+04F6            379      
+04F6 53D0E7     380       anl PSW, #0E7H ;
+04F9            381      
+04F9            382       ; save the R registers
+04F9            383      
+04F9 C000       384       push 00h
+04FB C001       385       push 01h
+04FD C003       386       push 03h
+04FF C004       387       push 04h
+0501 C007       388       push 07h
+0503            389   
+0503            390       ; Only show if not state 0
+0503 E537       391       mov a, FSM1_state
+0505 6055       392       jz DEL_Clear
+0507            393   
+0507            394       ; Copy elapsed_sec to R3:R4 (16-bit)
+0507 AC41       395       mov R4, elapsed_sec+0
+0509 AB42       396       mov R3, elapsed_sec+1
+050B            397   
+050B            398       ; Cap at 9999 for display safety
+050B            399       ; if R3:R4 > 9999 then force 9999
+050B EB         400       mov a, R3
+050C C3         401       clr c
+050D 9403       402       subb a, #high(999)
+050F 400E       403       jc DEL_Print
+0511 7008       404       jnz DEL_Force999
+0513 EC         405       mov a, R4
+0514 C3         406       clr c
+0515 94E7       407       subb a, #low(999)
+0517 5002       408       jnc DEL_Force999
+0519 8004       409       sjmp DEL_Print
+051B            410   
+051B            411   DEL_Force999:
+051B 7B03       412       mov R3, #high(999)
+051D 7CE7       413       mov R4, #low(999)
+051F            414   
+051F            415   DEL_Print:
+051F            416       ; thousands, hundreds, tens, ones using repeated subtraction
+051F 7900       417       mov R1, #0    ; thousands
+0521            418   ;DEL_Thou_L:
+0521            419       ; if < 1000 stop
+0521            420       ;mov a, R3
+0521            421       ;jnz DEL_Thou_Sub
+0521            422       ;mov a, R4
+0521            423       ;clr c
+0521            424       ;subb a, #low(1000)
+0521            425       ;jc DEL_Thou_D
+0521            426   ;DEL_Thou_Sub:
+0521            427       ;; (R3:R4) -= 1000
+0521            428       ;mov a, R4
+0521            429       ;clr c
+0521            430       ;subb a, #low(1000)
+0521            431       ;mov R4, a
+0521            432       ;mov a, R3
+0521            433       ;subb a, #high(1000)
+0521            434       ;mov R3, a
+0521            435       ;inc R2
+0521            436       ;sjmp DEL_Thou_L
+0521            437   ;DEL_Thou_D:
+0521            438   
+0521            439       ;mov R1, #0    ; hundreds
+0521            440   DEL_Hund_L:
+0521            441       ; if < 100 stop
+0521 EB         442       mov a, R3
+0522 7006       443       jnz DEL_Hund_Sub
+0524 EC         444       mov a, R4
+0525 C3         445       clr c
+0526 9464       446       subb a, #100
+0528 400C       447       jc DEL_Hund_D
+052A            448   DEL_Hund_Sub:
+052A EC         449       mov a, R4
+052B C3         450       clr c
+052C 9464       451       subb a, #100
+052E FC         452       mov R4, a
+052F EB         453       mov a, R3
+0530 9400       454       subb a, #0
+0532 FB         455       mov R3, a
+0533 09         456       inc R1
+0534 80EB       457       sjmp DEL_Hund_L
+0536            458   DEL_Hund_D:
+0536            459   
+0536            460       ; tens and ones from remaining (0..99) in R4
+0536 EC         461       mov a, R4
+0537 75F00A     462       mov b, #10
+053A 84         463       div ab        ; A=tens, B=ones
+053B F8         464       mov R0, A     ; tens
+053C AFF0       465       mov R7, B     ; ones
+053E            466   
+053E            467       ; Print at row1 col14..16
+053E C0E0       468            push acc
+0540 740E       468            mov a, #14
+0542 14         468            dec a
+0543 1200DC     468            lcall ?Set_Cursor_1 ; Select column and row
+0546 D0E0       468            pop acc
+0548 E9         469       mov a, R1
+0549 2430       470       add a, #'0'
+054B 120092     471       lcall ?WriteData
+054E E8         472       mov a, R0
+054F 2430       473       add a, #'0'
+0551 120092     474       lcall ?WriteData
+0554 EF         475       mov a, R7
+0555 2430       476       add a, #'0'
+0557 120092     477       lcall ?WriteData
+055A 801E       478       sjmp DEL_Done
+055C            479   
+055C            480   DEL_Clear:
+055C            481       ; In state0, clear those 4 slots
+055C C0E0       482            push acc
+055E 740E       482            mov a, #14
+0560 14         482            dec a
+0561 1200DC     482            lcall ?Set_Cursor_1 ; Select column and row
+0564 D0E0       482            pop acc
+0566 7420       483       mov a, #' '
+0568 120092     484       lcall ?WriteData
+056B 7420       485       mov a, #' '
+056D 120092     486       lcall ?WriteData
+0570 7420       487       mov a, #' '
+0572 120092     488       lcall ?WriteData
+0575 7420       489       mov a, #' '
+0577 120092     490       lcall ?WriteData
+057A            491   
+057A            492   DEL_Done:
+057A            493   
+057A            494   
+057A D007       495   pop 07h
+057C D004       496   pop 04h
+057E D003       497   pop 03h
+0580 D001       498   pop 01h
+0582 D000       499   pop 00h
+0584            500   
+0584            501   
+0584 D083       502   pop dph
+0586 D082       503   pop dpl
+0588 D0D0       504       pop psw
+058A D0F0       505       pop b
+058C D0E0       506       pop acc
+058E 22         507       ret
+058F            508      
+058F            509   
+058F            510   ;LCD FUNCTION
+058F            511   Clear_LCD_OnStateChange:
+058F            512   
+058F C0E0       513   push acc
+0591 C0D0       514   push psw
+0593 C082       515   push dpl
+0595 C083       516   push dph
+0597 C000       517   push 0
+0599            518   
+0599 E537       519   mov a, FSM1_state
+059B B54002     520   cjne a, last_lcd_state, CLS_clear
+059E 8028       521   sjmp CLS_done
+05A0            522   
+05A0            523   CLS_clear:
+05A0            524   
+05A0 F540       525   mov last_lcd_state, a
+05A2            526   
+05A2 C0E0       527            push acc
+05A4 7401       527            mov a, #1
+05A6 14         527            dec a
+05A7 1200DC     527            lcall ?Set_Cursor_1 ; Select column and row
+05AA D0E0       527            pop acc
+05AC 780D       528   mov R0, #13
+05AE            529   
+05AE            530   CLS_row1:
+05AE            531   
+05AE 7420       532   mov a, #' '
+05B0 120092     533   lcall ?WriteData
+05B3 D8F9       534   djnz R0, CLS_row1
+05B5            535   
+05B5 C0E0       536            push acc
+05B7 7401       536            mov a, #1
+05B9 14         536            dec a
+05BA 1200DA     536            lcall ?Set_Cursor_2 ; Select column and row
+05BD D0E0       536            pop acc
+05BF 7810       537   mov R0, #16
+05C1            538   
+05C1            539   CLS_row2:
+05C1            540   
+05C1 7420       541   mov a, #' '
+05C3 120092     542   lcall ?WriteData
+05C6 D8F9       543   djnz R0, CLS_row2
+05C8            544   
+05C8            545   CLS_done:
+05C8            546   
+05C8 D000       547   pop 0
+05CA D083       548   pop dph
+05CC D082       549   pop dpl
+05CE D0D0       550   pop psw
+05D0 D0E0       551   pop acc
+05D2 22         552   ret
+05D3            553   
+05D3            554   ;LCD FUNCTION
+05D3            555   
+05D3            556   Draw_State_Header_Row1:
+05D3            557   
+05D3 C0E0       558   push acc
+05D5 C082       559   push dpl
+05D7 C083       560   push dph
+05D9            561   
+05D9            562   
+05D9 E537       563   mov a, FSM1_state
+05DB 7003       564   jnz DSH_s1 ; if in state 0 don't print the state header
+05DD 02066F     565   ljmp DSH_done
+05E0            566   
+05E0            567   DSH_s1:
+05E0 C0E0       568            push acc
+05E2 7401       568            mov a, #1
+05E4 14         568            dec a
+05E5 1200DC     568            lcall ?Set_Cursor_1 ; Select column and row
+05E8 D0E0       568            pop acc
+05EA            569   
+05EA B40114     570   cjne a, #1, DSH_s2
+05ED C083       571            push dph
+05EF C082       571            push dpl
+05F1 C0E0       571            push acc
+05F3 900382     571            mov dptr, #State1_Line1
+05F6 1200CF     571            lcall ?Send_Constant_String
+05F9 D0E0       571            pop acc
+05FB D082       571            pop dpl
+05FD D083       571            pop dph
+05FF 806E       572   sjmp DSH_done
+0601            573   
+0601            574   DSH_s2:
+0601            575   
+0601 B40214     576       cjne a, #2, DSH_s3
+0604 C083       577            push dph
+0606 C082       577            push dpl
+0608 C0E0       577            push acc
+060A 90038F     577            mov dptr, #State2_Line1
+060D 1200CF     577            lcall ?Send_Constant_String
+0610 D0E0       577            pop acc
+0612 D082       577            pop dpl
+0614 D083       577            pop dph
+0616 8057       578       sjmp DSH_done
+0618            579   
+0618            580   DSH_s3:
+0618            581   
+0618 B40314     582       cjne a, #3, DSH_s4
+061B C083       583            push dph
+061D C082       583            push dpl
+061F C0E0       583            push acc
+0621 90039C     583            mov dptr, #State3_Line1
+0624 1200CF     583            lcall ?Send_Constant_String
+0627 D0E0       583            pop acc
+0629 D082       583            pop dpl
+062B D083       583            pop dph
+062D 8040       584       sjmp DSH_done
+062F            585   
+062F            586   DSH_s4:
+062F            587   
+062F B40414     588       cjne a, #4, DSH_s5
+0632 C083       589            push dph
+0634 C082       589            push dpl
+0636 C0E0       589            push acc
+0638 9003A9     589            mov dptr, #State4_Line1
+063B 1200CF     589            lcall ?Send_Constant_String
+063E D0E0       589            pop acc
+0640 D082       589            pop dpl
+0642 D083       589            pop dph
+0644 8029       590       sjmp DSH_done
+0646            591   
+0646            592   DSH_s5:
+0646            593   
+0646 B40514     594       cjne a, #5, DSH_s6
+0649 C083       595            push dph
+064B C082       595            push dpl
+064D C0E0       595            push acc
+064F 9003B6     595            mov dptr, #State5_Line1
+0652 1200CF     595            lcall ?Send_Constant_String
+0655 D0E0       595            pop acc
+0657 D082       595            pop dpl
+0659 D083       595            pop dph
+065B 8012       596       sjmp DSH_done
+065D            597   
+065D            598   DSH_s6:
+065D            599   
+065D C083       600            push dph
+065F C082       600            push dpl
+0661 C0E0       600            push acc
+0663 9003C3     600            mov dptr, #State6_Line1
+0666 1200CF     600            lcall ?Send_Constant_String
+0669 D0E0       600            pop acc
+066B D082       600            pop dpl
+066D D083       600            pop dph
+066F            601   
+066F            602   DSH_done:
+066F D083       603       pop dph
+0671 D082       604       pop dpl
+0673 D0E0       605       pop acc
+0675 22         606       ret
+0676            607   
+0676            608   ; -----------------------------------
+0676            609   ; FSM1
+0676            610   ; -----------------------------------
+0676            611   FSM1:
+0676 E537       612   mov a, FSM1_state
+0678            613   
+0678            614   FSM_state0:
+0678 B4003E     615   cjne a, #0, FSM1_state1
+067B 753D00     616   mov pwm, #0
+067E            617   
+067E E560       618   mov a, edit_digits
+0680 7013       619   jnz S0_sel_same
+0682            620   
+0682 120DB3     621   lcall ReadParamSel_SW01
+0685            622   
+0685 E55E       623   mov a, param_sel
+0687 B56102     624   cjne a, prev_sel, S0_sel_changed
+068A 8009       625   sjmp S0_sel_same
+068C            626   
+068C            627   S0_sel_changed:
+068C 855E61     628   mov prev_sel, param_sel
+068F 755F00     629   mov edit_value, #0
+0692 756000     630   mov edit_digits, #0
+0695            631   
+0695            632   S0_sel_same:
+0695            633   
+0695 120D5B     634       lcall Get3Digits
+0698 500B       635       jnc S0_not_ready
+069A            636   
+069A E55F       637       mov a, edit_value
+069C 120DC9     638       lcall ApplyEditValue_ToSelectedParam
+069F            639   
+069F 755F00     640       mov edit_value, #0
+06A2 756000     641       mov edit_digits, #0
+06A5            642   
+06A5            643   S0_not_ready:
+06A5 120DEB     644     lcall State0_DrawLCD
+06A8            645   
+06A8 20EA0B     646   jb Start_Switch, FSM1_state0_done
+06AB 753F00     647   mov sec, #0
+06AE C202       648   clr Reached50_flag
+06B0 753701     649   mov FSM1_state, #1
+06B3 120987     650   lcall playSingle_beep
+06B6            651   
+06B6            652   FSM1_state0_done:
+06B6 02080A     653   ljmp FSM2
+06B9            654   
+06B9            655   ; state 1 ramping to soak
+06B9            656   FSM1_state1:
+06B9 B4013A     657   cjne a, #1, FSM1_state2
+06BC 753D64     658   mov pwm, #100
+06BF            659   ;abort button check
+06BF 20EF32     660   jb Abort_switch , error_found_jump
+06C2            661   
+06C2 E53E       662       mov a, temp
+06C4 C3         663       clr c
+06C5 9432       664       subb a, #50
+06C7 4002       665       jc  temp_below_50
+06C9 D202       666       setb Reached50_flag
+06CB            667   
+06CB            668   temp_below_50:
+06CB E53F       669       mov a, sec
+06CD C3         670       clr c
+06CE 943C       671       subb a, #60
+06D0 400F       672       jc  continue_preheat
+06D2 20020C     673       jb  Reached50_flag, continue_preheat
+06D5            674   
+06D5 753D00     675       mov pwm, #0
+06D8 753706     676       mov FSM1_state, #6
+06DB 120990     677       lcall ten_beeps
+06DE 02080A     678       ljmp FSM2
+06E1            679   
+06E1            680   continue_preheat:
+06E1 E538       681       mov a, temp_soak
+06E3 C3         682       clr c
+06E4 953E       683       subb a, temp
+06E6 5009       684       jnc FSM1_state1_done
+06E8 753F00     685       mov sec, #0
+06EB 753702     686       mov FSM1_state, #2
+06EE 120987     687       lcall playSingle_beep
+06F1            688   
+06F1            689   FSM1_state1_done:
+06F1 02080A     690   ljmp FSM2
+06F4            691   
+06F4            692   error_found_jump:
+06F4 8067       693   sjmp error_found
+06F6            694   
+06F6            695   FSM1_state2:
+06F6 B40219     696   cjne a, #2, FSM1_state3
+06F9 20EF61     697   jb Abort_switch, error_found
+06FC 753D14     698   mov pwm, #20
+06FF E539       699   mov a, time_soak
+0701 C3         700   clr c
+0702 953F       701   subb a, sec
+0704 5009       702   jnc FSM1_state2_done
+0706 753F00     703   mov sec, #0
+0709 753703     704   mov FSM1_state, #3
+070C 120987     705   lcall playSingle_beep
+070F            706   
+070F            707   FSM1_state2_done:
+070F 02080A     708   ljmp FSM2
+0712            709   
+0712            710   FSM1_state3:
+0712 B40319     711   cjne a, #3, FSM1_state4
+0715 20EF45     712   jb Abort_switch, error_found
+0718 753D64     713   mov pwm, #100
+071B E53A       714   mov a, temp_refl
+071D C3         715   clr c
+071E 953E       716   subb a, temp
+0720 5009       717   jnc FSM1_state3_done
+0722 753F00     718   mov sec, #0
+0725 753704     719   mov FSM1_state, #4
+0728 120987     720   lcall playSingle_beep
+072B            721   
+072B            722   FSM1_state3_done:
+072B 02080A     723   ljmp FSM2
+072E            724   
+072E            725   FSM1_state4:
+072E B40416     726   cjne a, #4, FSM1_state5
+0731 20EF29     727   jb Abort_switch, error_found
+0734 753D14     728   mov pwm, #20
+0737 E53B       729   mov a, time_refl
+0739 C3         730   clr c
+073A 953F       731   subb a, sec
+073C 5006       732   jnc FSM1_state4_done
+073E 753705     733   mov FSM1_state, #5
+0741 120987     734   lcall playSingle_beep
+0744            735   
+0744            736   FSM1_state4_done:
+0744 02080A     737   ljmp FSM2
+0747            738   
+0747            739   FSM1_state5:
+0747 B40521     740   cjne a, #5, FSM1_state6
+074A 753D00     741   mov pwm, #0
+074D E53E       742   mov a, temp
+074F C3         743   clr c
+0750 943C       744   subb a, #60
+0752 5006       745   jnc FSM_state5_done
+0754 120999     746   lcall five_beeps
+0757 753700     747   mov FSM1_state, #0
+075A            748   
+075A            749   FSM_state5_done:
+075A 02080A     750   ljmp FSM2
+075D            751   
+075D            752   error_found:
+075D 8000       753   sjmp trigger_error
+075F            754   
+075F            755   trigger_error:
+075F 753705     756   mov FSM1_state, #5
+0762 753D00     757   mov pwm , #0
+0765 120990     758   lcall ten_beeps
+0768 02080A     759   ljmp FSM2
+076B            760   
+076B            761   ; error check
+076B            762   FSM1_state6:
+076B B40602     763       cjne a, #6, not_error
+076E 8003       764       sjmp is_error
+0770            765   
+0770            766   not_error:
+0770 020678     767       ljmp FSM_state0
+0773            768   
+0773            769   is_error:
+0773 753D00     770       mov pwm, #0
+0776 20EA03     771       jb Start_Switch, FSM_state6_done
+0779 02080A     772       ljmp FSM2
+077C            773   
+077C            774   FSM_state6_done:
+077C 753700     775       mov FSM1_state, #0
+077F 02080A     776       ljmp FSM2
+0782            777   
+0782            778   ;---------------------------------;
+0782            779   ; Main program
+0782            780   ;---------------------------------;
+0782            781   main:
+0782 758170     782       mov SP, #0x70
+0785 753700     783       mov FSM1_state, #0
+0788            784      
+0788            785       ;LCD FUNCTION
+0788 754000     786       mov last_lcd_state, #0
+078B            787   
+078B            788   
+078B 1203D0     789       lcall Timer0_Init
+078E 1203EC     790       lcall Timer2_Init
+0791 12094B     791       lcall Initialize_Serial_Port
+0794            792   
+0794 759AAA     793       mov P0MOD, #10101010b
+0797 759BA2     794       mov P1MOD, #10100010b
+079A 759CFF     795       mov P2MOD, #0xff
+079D 759DFF     796       mov P3MOD, #0xff
+07A0            797   
+07A0            798       ; ==============================
+07A0            799       ; Init ADXL345 (onboard accelerometer)
+07A0            800       ; ==============================
+07A0 120F26     801       lcall ADXL345_Configure
+07A3 756800     802       mov tilt_fault, #0
+07A6            803   
+07A6 75E800     804       mov LEDRA, #0
+07A9 759500     805       mov LEDRB, #0
+07AC            806   
+07AC D2AF       807       setb EA
+07AE 12009C     808       lcall ELCD_4BIT
+07B1            809   
+07B1 C0E0       810            push acc
+07B3 7401       810            mov a, #1
+07B5 14         810            dec a
+07B6 1200DC     810            lcall ?Set_Cursor_1 ; Select column and row
+07B9 D0E0       810            pop acc
+07BB C083       811            push dph
+07BD C082       811            push dpl
+07BF C0E0       811            push acc
+07C1 900367     811            mov dptr, #Initial_Message
+07C4 1200CF     811            lcall ?Send_Constant_String
+07C7 D0E0       811            pop acc
+07C9 D082       811            pop dpl
+07CB D083       811            pop dph
+07CD D200       812       setb half_seconds_flag
+07CF 753400     813   mov BCD_counter, #0x00
+07D2            814   
+07D2 755498     815       mov T_cold+0, #098h
+07D5 755508     816       mov T_cold+1, #008h
+07D8 755600     817       mov T_cold+2, #000h
+07DB 755700     818       mov T_cold+3, #000h
+07DE 75A180     819   mov ADC_C, #080h
+07E1 C002       820            push AR2
+07E3 7A32       820            mov R2, #50
+07E5 12004D     820            lcall ?Wait_Milli_Seconds
+07E8 D002       820            pop AR2
+07EA            821   
+07EA 753896     822       mov temp_soak,  #150
+07ED 75393C     823       mov time_soak,  #60
+07F0 753ADC     824       mov temp_refl,  #220
+07F3 753B2D     825       mov time_refl,  #45
+07F6            826   
+07F6 120BB1     827       lcall Configure_Keypad_Pins
+07F9            828   
+07F9 120DB3     829       lcall ReadParamSel_SW01
+07FC 855E61     830       mov  prev_sel, param_sel
+07FF 755F00     831       mov  edit_value, #0
+0802 756000     832       mov  edit_digits, #0
+0805            833   
+0805            834       ; NEW
+0805 E4         835       clr a
+0806 F541       836       mov elapsed_sec+0, a
+0808 F542       837       mov elapsed_sec+1, a
+080A            838   
+080A            839   FSM2:
+080A            840   ; ==========================================================
+080A            841   ; RESET BUTTON (KEY0) to force state0 and reset everything
+080A            842   ; ==========================================================
+080A 20F812     843       jb RESET_BTN, FSM2_NoReset
+080D C002       844            push AR2
+080F 7A32       844            mov R2, #50
+0811 12004D     844            lcall ?Wait_Milli_Seconds
+0814 D002       844            pop AR2
+0816 20F806     845       jb RESET_BTN, FSM2_NoReset
+0819 30F8FD     846       jnb RESET_BTN, $      ; wait release
+081C 1204D0     847       lcall Force_Reset_To_State0
+081F            848   FSM2_NoReset:
+081F            849   
+081F            850   skip_beep:
+081F            851   
+081F            852   ; KEY1 handling (your original counter reset)
+081F 20F91D     853   jb KEY.1, loop_a
+0822 C002       854            push AR2
+0824 7A32       854            mov R2, #50
+0826 12004D     854            lcall ?Wait_Milli_Seconds
+0829 D002       854            pop AR2
+082B 20F911     855   jb KEY.1, loop_a
+082E 30F9FD     856   jnb KEY.1, $
+0831 C2CA       857   clr TR2
+0833 E4         858   clr a
+0834 F530       859   mov Count1ms+0, a
+0836 F531       860   mov Count1ms+1, a
+0838 F534       861   mov BCD_counter, a
+083A D2CA       862   setb TR2
+083C 020858     863   ljmp loop_b
+083F            864   
+083F            865   loop_a:
+083F 300016     866   jnb half_seconds_flag, loop_b
+0842            867   
+0842            868   
+0842 C0E0       869            push acc
+0844 7407       869            mov a, #7
+0846 14         869            dec a
+0847 1200DC     869            lcall ?Set_Cursor_1 ; Select column and row
+084A D0E0       869            pop acc
+084C 1208DA     870       lcall Display_TempC_7seg
+084F            871       ;lcall send_temp_serial
+084F 120FAF     872       lcall send_all_serial_3digits
+0852 120B48     873       lcall PrintStateSerial
+0855            874   
+0855            875       ; ==============================
+0855            876       ; Tilt abort check (runs at 500ms rate)
+0855            877       ; ==============================
+0855 120F46     878       lcall Check_Tilt_Abort
+0858            879   
+0858            880   loop_b:
+0858 C200       881       clr half_seconds_flag
+085A 120A2E     882       lcall Read_Ref
+085D 120A3B     883       lcall Read_op_amp_mv
+0860 120A8B     884       lcall VoutmV_To_TempC
+0863            885   
+0863            886       ; NEW: show total elapsed time (seconds) on LCD in states 1..6
+0863 12058F     887       lcall Clear_LCD_OnStateChange
+0866 1205D3     888       lcall Draw_State_Header_Row1
+0869 1204EC     889       lcall Display_Elapsed_LCD
+086C 120872     890       lcall Display_StateTimer_LCD
+086F            891   
+086F 020676     892       ljmp FSM1
+0872            893   
+0872            894   ; ===== SUBROUTINES BELOW =====
+0872            895   
+0872            896   
+0872            897   Display_StateTimer_LCD:
+0872 C0E0       898       push acc
+0874 C0F0       899       push b
+0876 C0D0       900       push psw
+0878 C082       901       push dpl
+087A C083       902       push dph
+087C            903   
+087C 53D0E7     904       anl PSW, #0E7h    
+087F            905   
+087F            906       ; If state  blank
+087F E537       907       mov a, FSM1_state
+0881 6033       908       jz DST_Clear
+0883            909   
+0883            910       ; Clamp sec to 999 just in case
+0883 E53F       911       mov a, sec
+0885 C3         912       clr c
+0886 9464       913       subb a, #100      
+0888            914   
+0888            915       ; Convert sec
+0888 E53F       916       mov a, sec
+088A 75F064     917       mov b, #100
+088D 84         918       div ab             ; a = hundreds, b = remainder
+088E FA         919       mov R2, a          ; hundreds
+088F E5F0       920       mov a, b
+0891 75F00A     921       mov b, #10
+0894 84         922       div ab             ; a = tens, b = ones
+0895 F9         923       mov R1, a          ; tens
+0896 A8F0       924       mov R0, b          ; ones
+0898            925   
+0898            926       ; Print at row2 col14..16
+0898 C0E0       927            push acc
+089A 740E       927            mov a, #14
+089C 14         927            dec a
+089D 1200DA     927            lcall ?Set_Cursor_2 ; Select column and row
+08A0 D0E0       927            pop acc
+08A2 EA         928       mov a, R2
+08A3 2430       929       add a, #'0'
+08A5 120092     930       lcall ?WriteData
+08A8 E9         931       mov a, R1
+08A9 2430       932       add a, #'0'
+08AB 120092     933       lcall ?WriteData
+08AE E8         934       mov a, R0
+08AF 2430       935       add a, #'0'
+08B1 120092     936       lcall ?WriteData
+08B4 8019       937       sjmp DST_Done
+08B6            938   
+08B6            939   DST_Clear:
+08B6 C0E0       940            push acc
+08B8 740E       940            mov a, #14
+08BA 14         940            dec a
+08BB 1200DA     940            lcall ?Set_Cursor_2 ; Select column and row
+08BE D0E0       940            pop acc
+08C0 7420       941       mov a, #' '
+08C2 120092     942       lcall ?WriteData
+08C5 7420       943       mov a, #' '
+08C7 120092     944       lcall ?WriteData
+08CA 7420       945       mov a, #' '
+08CC 120092     946       lcall ?WriteData
+08CF            947   
+08CF            948   DST_Done:
+08CF D083       949       pop dph
+08D1 D082       950       pop dpl
+08D3 D0D0       951       pop psw
+08D5 D0F0       952       pop b
+08D7 D0E0       953       pop acc
+08D9 22         954       ret
+08DA            955   
+08DA            956   
+08DA            957   
+08DA            958   Display_TempC_7Seg:
+08DA C0E0       959       push acc
+08DC C0F0       960       push b
+08DE C082       961       push dpl
+08E0 C083       962       push dph
+08E2            963   
+08E2 855843     964       mov x+0, t_hot+0
+08E5 855944     965       mov x+1, t_hot+1
+08E8 855A45     966       mov x+2, t_hot+2
+08EB 855B46     967       mov x+3, t_hot+3
+08EE            968   
+08EE 754764     969            mov y+0, #low (100 % 0x10000) 
+08F1 754800     969            mov y+1, #high(100 % 0x10000) 
+08F4 754900     969            mov y+2, #low (100 / 0x10000) 
+08F7 754A00     969            mov y+3, #high(100 / 0x10000) 
+08FA 1202FE     970       lcall div32
+08FD            971   
+08FD AC43       972       mov R4, x+0
+08FF AB44       973       mov R3, x+1
+0901            974   
+0901 7A00       975       mov R2, #0
+0903            976   
+0903            977   DT_Hund_Loop:
+0903 EB         978       mov a, R3
+0904 7006       979       jnz DT_Hund_Sub
+0906 EC         980       mov a, R4
+0907 C3         981       clr c
+0908 9464       982       subb a, #100
+090A 400C       983       jc  DT_Hund_Done
+090C            984   
+090C            985   DT_Hund_Sub:
+090C EC         986       mov a, R4
+090D C3         987       clr c
+090E 9464       988       subb a, #100
+0910 FC         989       mov R4, a
+0911 EB         990       mov a, R3
+0912 9400       991       subb a, #0
+0914 FB         992       mov R3, a
+0915 0A         993       inc R2
+0916 80EB       994       sjmp DT_Hund_Loop
+0918            995   
+0918            996   DT_Hund_Done:
+0918 EC         997       mov a, R4
+0919 75F00A     998       mov b, #10
+091C 84         999       div ab
+091D F9        1000       mov R1, A
+091E A8F0      1001       mov R0, B
+0920           1002   
+0920 9004C0    1003       mov dptr, #T_7seg
+0923           1004   
+0923 E8        1005       mov a, R0
+0924 93        1006       movc a, @a+dptr
+0925 F591      1007       mov HEX0, a
+0927           1008   
+0927 EA        1009       mov a, R2
+0928 7008      1010       jnz DT_Show_Tens
+092A E9        1011       mov a, R1
+092B 7005      1012       jnz DT_Show_Tens
+092D 7592FF    1013       mov HEX1, #0FFh
+0930 8004      1014       sjmp DT_Do_Hund
+0932           1015   
+0932           1016   DT_Show_Tens:
+0932 E9        1017       mov a, R1
+0933 93        1018       movc a, @a+dptr
+0934 F592      1019       mov HEX1, a
+0936           1020   
+0936           1021   DT_Do_Hund:
+0936 EA        1022       mov a, R2
+0937 7005      1023       jnz DT_Show_Hund
+0939 7593FF    1024       mov HEX2, #0FFh
+093C 8004      1025       sjmp DT_Done
+093E           1026   
+093E           1027   DT_Show_Hund:
+093E EA        1028       mov a, R2
+093F 93        1029       movc a, @a+dptr
+0940 F593      1030       mov HEX2, a
+0942           1031   
+0942           1032   DT_Done:
+0942 D083      1033       pop dph
+0944 D082      1034       pop dpl
+0946 D0F0      1035       pop b
+0948 D0E0      1036       pop acc
+094A 22        1037       ret
+094B           1038   
+094B           1039   Initialize_Serial_Port:
+094B C28E      1040   clr TR1
+094D 53890F    1041   anl TMOD, #0x0f
+0950 438920    1042   orl TMOD, #0x20
+0953 438780    1043   orl PCON, #80H
+0956 758DFD    1044   mov TH1, #low(TIMER_1_RELOAD)
+0959 758BFD    1045   mov TL1, #low(TIMER_1_RELOAD)
+095C D28E      1046   setb TR1
+095E 759852    1047   mov SCON, #52H
+0961 D299      1048       setb TI
+0963 22        1049   ret
+0964           1050   
+0964           1051   putchar:
+0964 3099FD    1052       jnb TI, $
+0967 C299      1053       clr TI
+0969 F599      1054       mov SBUF, a
+096B 22        1055       ret
+096C           1056   
+096C           1057   SendString:
+096C E4        1058       clr a
+096D 93        1059       movc a, @a+dptr
+096E 6006      1060       jz SendString_done
+0970 120964    1061       lcall putchar
+0973 A3        1062       inc dptr
+0974 80F6      1063       sjmp SendString
+0976           1064   SendString_done:
+0976 22        1065       ret
+0977           1066   
+0977           1067   PrintU32:
+0977 E543      1068       mov a, x+0
+0979 4544      1069       orl a, x+1
+097B 4545      1070       orl a, x+2
+097D 4546      1071       orl a, x+3
+097F 7021      1072       jnz PU32_go
+0981           1073   
+0981 7430      1074       mov a, #'0'
+0983 120964    1075       lcall putchar
+0986 22        1076       ret
+0987           1077   
+0987           1078   playSingle_beep:
+0987 753501    1079   mov beep_count, #1
+098A E4        1080   clr a
+098B F530      1081   mov Count1ms+0, a
+098D F531      1082   mov Count1ms+1, a
+098F 22        1083   ret
+0990           1084   
+0990           1085   ten_beeps:
+0990 75350A    1086   mov beep_count, #10
+0993 E4        1087   clr a
+0994 F530      1088   mov Count1ms+0, a
+0996 F531      1089   mov Count1ms+1, a
+0998 22        1090   ret
+0999           1091   
+0999           1092   five_beeps:
+0999 753505    1093   mov beep_count, #5
+099C E4        1094   clr a
+099D F530      1095   mov Count1ms+0, a
+099F F531      1096   mov Count1ms+1, a
+09A1 22        1097   ret
+09A2           1098   
+09A2           1099   PU32_go:
+09A2 7F00      1100       mov R7, #0
+09A4           1101   
+09A4           1102   PU32_loop:
+09A4 75470A    1103            mov y+0, #low (10 % 0x10000) 
+09A7 754800    1103            mov y+1, #high(10 % 0x10000) 
+09AA 754900    1103            mov y+2, #low (10 / 0x10000) 
+09AD 754A00    1103            mov y+3, #high(10 / 0x10000) 
+09B0 1202FE    1104       lcall div32
+09B3           1105   
+09B3 E547      1106       mov a, y+0
+09B5 2430      1107       add a, #'0'
+09B7 C0E0      1108       push acc
+09B9 0F        1109       inc R7
+09BA           1110   
+09BA E543      1111       mov a, x+0
+09BC 4544      1112       orl a, x+1
+09BE 4545      1113       orl a, x+2
+09C0 4546      1114       orl a, x+3
+09C2 70E0      1115       jnz PU32_loop
+09C4           1116   
+09C4           1117   PU32_pop:
+09C4 D0E0      1118       pop acc
+09C6 120964    1119       lcall putchar
+09C9 DFF9      1120       djnz R7, PU32_pop
+09CB 22        1121       ret
+09CC           1122   
+09CC           1123   send_temp_serial:
+09CC 855843    1124       mov x+0, t_hot+0
+09CF 855944    1125       mov x+1, t_hot+1
+09D2 855A45    1126       mov x+2, t_hot+2
+09D5 855B46    1127       mov x+3, t_hot+3
+09D8           1128   
+09D8 754764    1129            mov y+0, #low (100 % 0x10000) 
+09DB 754800    1129            mov y+1, #high(100 % 0x10000) 
+09DE 754900    1129            mov y+2, #low (100 / 0x10000) 
+09E1 754A00    1129            mov y+3, #high(100 / 0x10000) 
+09E4 1202FE    1130       lcall div32
+09E7 85433E    1131       mov temp, x+0
+09EA           1132   
+09EA AC43      1133       mov R4, x+0
+09EC AB44      1134       mov R3, x+1
+09EE           1135   
+09EE 7A00      1136       mov R2, #0
+09F0           1137   
+09F0           1138   Hund_loop:
+09F0 EB        1139       mov a, R3
+09F1 7006      1140       jnz Hund_sub
+09F3 EC        1141       mov a, R4
+09F4 C3        1142       clr c
+09F5 9464      1143       subb a, #100
+09F7 400C      1144       jc  Hund_done
+09F9           1145   
+09F9           1146   Hund_sub:
+09F9 EC        1147       mov a, R4
+09FA C3        1148       clr c
+09FB 9464      1149       subb a, #100
+09FD FC        1150       mov R4, a
+09FE EB        1151       mov a, R3
+09FF 9400      1152       subb a, #0
+0A01 FB        1153       mov R3, a
+0A02 0A        1154       inc R2
+0A03 80EB      1155       sjmp Hund_loop
+0A05           1156   
+0A05           1157   Hund_done:
+0A05 EA        1158       mov a, R2
+0A06 2430      1159       add a, #'0'
+0A08 120964    1160       lcall putchar
+0A0B           1161   
+0A0B EC        1162       mov a, R4
+0A0C 75F00A    1163       mov b, #10
+0A0F 84        1164       div ab
+0A10           1165   
+0A10 2430      1166       add a, #'0'
+0A12 120964    1167       lcall putchar
+0A15 E5F0      1168       mov a, b
+0A17 2430      1169       add a, #'0'
+0A19 120964    1170       lcall putchar
+0A1C           1171   
+0A1C 740D      1172       mov a, #0Dh
+0A1E 120964    1173       lcall putchar
+0A21 740A      1174       mov a, #0Ah
+0A23 120964    1175       lcall putchar
+0A26 22        1176       ret
+0A27           1177   
+0A27           1178   Read_ADC:
+0A27 F5A1      1179   mov ADC_C, a
+0A29 A9A3      1180   mov R1, ADC_H
+0A2B A8A2      1181   mov R0, ADC_L
+0A2D 22        1182   ret
+0A2E           1183   
+0A2E           1184   Read_Ref:
+0A2E 7400      1185       mov a, #00h
+0A30 120A27    1186       lcall Read_ADC
+0A33 120A27    1187       lcall Read_ADC
+0A36 885C      1188       mov VAL_LM4040+0, R0
+0A38 895D      1189       mov VAL_LM4040+1, R1
+0A3A 22        1190       ret
+0A3B           1191   
+0A3B           1192   Read_op_amp_mv:
+0A3B E55C      1193       mov A, VAL_LM4040+0
+0A3D 455D      1194       orl A, VAL_LM4040+1
+0A3F 700D      1195       jnz _ref_ok
+0A41           1196   
+0A41 755000    1197       mov V_amp_mv+0, #00h
+0A44 755100    1198       mov V_amp_mv+1, #00h
+0A47 755200    1199       mov V_amp_mv+2, #00h
+0A4A 755300    1200       mov V_amp_mv+3, #00h
+0A4D 22        1201       ret
+0A4E           1202   
+0A4E           1203   _ref_ok:
+0A4E 7401      1204       mov a, #01h
+0A50 120A27    1205       lcall Read_ADC
+0A53 120A27    1206       lcall Read_ADC
+0A56           1207   
+0A56 8843      1208       mov x+0, R0
+0A58 8944      1209       mov x+1, R1
+0A5A 754500    1210       mov x+2, #00h
+0A5D 754600    1211       mov x+3, #00h
+0A60           1212   
+0A60 754700    1213            mov y+0, #low (4096 % 0x10000) 
+0A63 754810    1213            mov y+1, #high(4096 % 0x10000) 
+0A66 754900    1213            mov y+2, #low (4096 / 0x10000) 
+0A69 754A00    1213            mov y+3, #high(4096 / 0x10000) 
+0A6C 120271    1214       lcall mul32
+0A6F           1215   
+0A6F 855C47    1216       mov y+0, VAL_LM4040+0
+0A72 855D48    1217       mov y+1, VAL_LM4040+1
+0A75 754900    1218       mov y+2, #00h
+0A78 754A00    1219       mov y+3, #00h
+0A7B           1220   
+0A7B 1202FE    1221       lcall div32
+0A7E           1222   
+0A7E 854350    1223       mov V_amp_mv+0, x+0
+0A81 854451    1224       mov V_amp_mv+1, x+1
+0A84 854552    1225       mov V_amp_mv+2, x+2
+0A87 854653    1226       mov V_amp_mv+3, x+3
+0A8A 22        1227       ret
+0A8B           1228   
+0A8B           1229   VoutmV_To_TempC:
+0A8B           1230   
+0A8B E4        1231     clr a
+0A8C F558      1232     mov t_hot+0, a
+0A8E F559      1233     mov t_hot+1, a
+0A90 F55A      1234     mov t_hot+2, a
+0A92 F55B      1235     mov t_hot+3, a
+0A94 7B0A      1236     mov R3, #10
+0A96           1237   
+0A96           1238    loop_temp:
+0A96           1239   
+0A96 120A3B    1240     lcall Read_op_amp_mv
+0A99           1241   
+0A99 855843    1242     mov x+0, t_hot+0
+0A9C 855944    1243     mov x+1, t_hot+1
+0A9F 855A45    1244     mov x+2, t_hot+2
+0AA2 855B46    1245     mov x+3, t_hot+3
+0AA5           1246   
+0AA5 E550      1247       mov A, V_amp_mv+0
+0AA7 F547      1248       mov y+0, A
+0AA9 E551      1249       mov A, V_amp_mv+1
+0AAB F548      1250       mov y+1, A
+0AAD E552      1251       mov A, V_amp_mv+2
+0AAF F549      1252       mov y+2, A
+0AB1 E553      1253       mov A, V_amp_mv+3
+0AB3 F54A      1254       mov y+3, A
+0AB5           1255   
+0AB5 1201BC    1256       lcall add32
+0AB8           1257   
+0AB8 854358    1258       mov t_hot+0, x+0
+0ABB 854459    1259       mov t_hot+1, x+1
+0ABE 85455A    1260       mov t_hot+2, x+2
+0AC1 85465B    1261       mov t_hot+3, x+3
+0AC4           1262   
+0AC4 DBD0      1263       djnz R3, loop_temp
+0AC6           1264   
+0AC6           1265   average_val:
+0AC6           1266   
+0AC6 855843    1267   mov x+0, t_hot+0
+0AC9 855944    1268   mov x+1, t_hot+1
+0ACC 855A45    1269   mov x+2, t_hot+2
+0ACF 855B46    1270   mov x+3, t_hot+3
+0AD2           1271   
+0AD2 75470A    1272            mov y+0, #low (10 % 0x10000) 
+0AD5 754800    1272            mov y+1, #high(10 % 0x10000) 
+0AD8 754900    1272            mov y+2, #low (10 / 0x10000) 
+0ADB 754A00    1272            mov y+3, #high(10 / 0x10000) 
+0ADE 1202FE    1273   lcall div32
+0AE1           1274   
+0AE1 7547E8    1275            mov y+0, #low (1000 % 0x10000) 
+0AE4 754803    1275            mov y+1, #high(1000 % 0x10000) 
+0AE7 754900    1275            mov y+2, #low (1000 / 0x10000) 
+0AEA 754A00    1275            mov y+3, #high(1000 / 0x10000) 
+0AED 120271    1276       lcall mul32
+0AF0           1277   
+0AF0 754732    1278            mov y+0, #low (306 % 0x10000) 
+0AF3 754801    1278            mov y+1, #high(306 % 0x10000) 
+0AF6 754900    1278            mov y+2, #low (306 / 0x10000) 
+0AF9 754A00    1278            mov y+3, #high(306 / 0x10000) 
+0AFC 1202FE    1279       lcall div32
+0AFF           1280   
+0AFF 754764    1281            mov y+0, #low (100 % 0x10000) 
+0B02 754800    1281            mov y+1, #high(100 % 0x10000) 
+0B05 754900    1281            mov y+2, #low (100 / 0x10000) 
+0B08 754A00    1281            mov y+3, #high(100 / 0x10000) 
+0B0B 120271    1282       lcall mul32
+0B0E           1283   
+0B0E 754729    1284            mov y+0, #low (41 % 0x10000) 
+0B11 754800    1284            mov y+1, #high(41 % 0x10000) 
+0B14 754900    1284            mov y+2, #low (41 / 0x10000) 
+0B17 754A00    1284            mov y+3, #high(41 / 0x10000) 
+0B1A 1202FE    1285       lcall div32
+0B1D           1286   
+0B1D E554      1287       mov A, T_cold+0
+0B1F F547      1288       mov y+0, A
+0B21 E555      1289       mov A, T_cold+1
+0B23 F548      1290       mov y+1, A
+0B25 E556      1291       mov A, T_cold+2
+0B27 F549      1292       mov y+2, A
+0B29 E557      1293       mov A, T_cold+3
+0B2B F54A      1294       mov y+3, A
+0B2D           1295   
+0B2D 1201BC    1296       lcall add32
+0B30           1297   
+0B30 E543      1298       mov A, x+0
+0B32 F558      1299       mov t_hot+0, A
+0B34 E544      1300       mov A, x+1
+0B36 F559      1301       mov t_hot+1, A
+0B38 E545      1302       mov A, x+2
+0B3A F55A      1303       mov t_hot+2, A
+0B3C E546      1304       mov A, x+3
+0B3E F55B      1305       mov t_hot+3, A
+0B40 22        1306       ret
+0B41           1307   
+0B41 53544154  1308   StateLabel: db 'STATE=',0
+     453D00
+0B48           1309   PrintStateSerial:
+0B48 C0E0      1310       push acc
+0B4A C082      1311       push dpl
+0B4C C083      1312       push dph
+0B4E           1313   
+0B4E 900B41    1314       mov dptr, #StateLabel
+0B51 12096C    1315       lcall SendString
+0B54           1316   
+0B54 E537      1317       mov a, FSM1_state
+0B56 2430      1318       add a, #'0'
+0B58 120964    1319       lcall putchar
+0B5B           1320   
+0B5B 740D      1321       mov a, #0Dh
+0B5D 120964    1322       lcall putchar
+0B60 740A      1323       mov a, #0Ah
+0B62 120964    1324       lcall putchar
+0B65           1325   
+0B65 D083      1326       pop dph
+0B67 D082      1327       pop dpl
+0B69 D0E0      1328       pop acc
+0B6B 22        1329       ret
+0B6C           1330   
+0B6C           1331   LCD_Print3Dec:
+0B6C C0E0      1332       push acc
+0B6E C0F0      1333       push b
+0B70 C0D0      1334       push psw
+0B72           1335   
+0B72 75F064    1336       mov b, #100
+0B75 84        1337       div ab
+0B76 2430      1338       add a, #'0'
+0B78 120092    1339       lcall ?WriteData
+0B7B           1340   
+0B7B E5F0      1341       mov a, b
+0B7D 75F00A    1342       mov b, #10
+0B80 84        1343       div ab
+0B81 2430      1344       add a, #'0'
+0B83 120092    1345       lcall ?WriteData
+0B86           1346   
+0B86 E5F0      1347       mov a, b
+0B88 2430      1348       add a, #'0'
+0B8A 120092    1349       lcall ?WriteData
+0B8D           1350   
+0B8D D0D0      1351       pop psw
+0B8F D0F0      1352       pop b
+0B91 D0E0      1353       pop acc
+0B93 22        1354       ret
+0B94           1355   
+0B94           1356   ; ---- keypad code unchanged below ----
+0B94           1357   
+0B94           1358   myLUT:
+0B94 C0F9A4B0  1359       DB 0xC0, 0xF9, 0xA4, 0xB0, 0x99        ; 0 TO 4
+     99
+0B99 9282F880  1360       DB 0x92, 0x82, 0xF8, 0x80, 0x90        ; 4 TO 9
+     90
+0B9E 8883C6A1  1361       DB 0x88, 0x83, 0xC6, 0xA1, 0x86, 0x8E  ; A to F
+     868E
+0BA4           1362   
+               1363   showBCD MAC
+               1364   ; Display LSD
+               1365       mov A, %0
+               1366       anl a, #0fh
+               1367       movc A, @A+dptr
+               1368       mov %1, A
+               1369   ; Display MSD
+               1370       mov A, %0
+               1371       swap a
+               1372       anl a, #0fh
+               1373       movc A, @A+dptr
+               1374       mov %2, A
+               1375   ENDMAC
+0BA4           1376   
+               1377   MYRLC MAC
+               1378   mov a, %0
+               1379   rlc a
+               1380   mov %0, a
+               1381   ENDMAC
+0BA4           1382   
+               1383   MYRRC MAC
+               1384   mov a, %0
+               1385   rrc a
+               1386   mov %0, a
+               1387   ENDMAC
+0BA4           1388   
+0BA4           1389   Wait25ms:
+0BA4           1390   ;33.33MHz, 1 clk per cycle: 0.03us
+0BA4 780F      1391   mov R0, #15
+0BA6           1392   L33:
+0BA6 794A      1393   mov R1, #74
+0BA8           1394   L22:
+0BA8 7AFA      1395   mov R2, #250
+0BAA           1396   L11:
+0BAA DAFE      1397   djnz R2, L11 ;3*250*0.03us=22.5us
+0BAC D9FA      1398       djnz R1, L22 ;74*22.5us=1.665ms
+0BAE D8F6      1399       djnz R0, L33 ;1.665ms*15=25ms
+0BB0 22        1400       ret
+0BB1           1401   
+               1402   CHECK_COLUMN MAC
+               1403   jb %0, CHECK_COL_%M
+               1404   mov R7, %1
+               1405   jnb %0, $ ; wait for key release
+               1406   setb c
+               1407   ret
+               1408   CHECK_COL_%M:
+               1409   ENDMAC
+0BB1           1410   
+0BB1           1411   Configure_Keypad_Pins:
+0BB1           1412   ; Configure the row pins as output and the column pins as inputs
+0BB1 439B54    1413   orl P1MOD, #0b_01010100 ; P1.6, P1.4, P1.2 output
+0BB4 439C01    1414   orl P2MOD, #0b_00000001 ; P2.0 output
+0BB7 539CAB    1415   anl P2MOD, #0b_10101011 ; P2.6, P2.4, P2.2 input
+0BBA 539DFE    1416   anl P3MOD, #0b_11111110 ; P3.0 input
+0BBD 22        1417   ret
+0BBE           1418   
+0BBE           1419   ; These are the pins used for the keypad in this program:
+0BBE           1420   ROW1 EQU P1.2
+0BBE           1421   ROW2 EQU P1.4
+0BBE           1422   ROW3 EQU P1.6
+0BBE           1423   ROw4 EQU P2.0
+0BBE           1424   COL1 EQU P2.2
+0BBE           1425   COL2 EQU P2.4
+0BBE           1426   COL3 EQU P2.6
+0BBE           1427   COL4 EQU P3.0
+0BBE           1428   
+0BBE           1429   Keypad:
+               1429   $MESSAGE TIP: KEY1 is the erase key
+0BBE 20F90B    1431   jb KEY.1, keypad_L0
+0BC1 120BA4    1432   lcall Wait25ms ; debounce
+0BC4 20F905    1433   jb KEY.1, keypad_L0
+0BC7 30F9FD    1434   jnb KEY.1, $ ; The key was pressed, wait for release
+0BCA C3        1435   clr c
+0BCB 22        1436   ret
+0BCC           1437   
+0BCC           1438   keypad_L0:
+0BCC C292      1439   clr ROW1
+0BCE C294      1440   clr ROW2
+0BD0 C296      1441   clr ROW3
+0BD2 C2A0      1442   clr ROW4
+0BD4 A2A2      1443   mov c, COL1
+0BD6 82A4      1444   anl c, COL2
+0BD8 82A6      1445   anl c, COL3
+0BDA 82B0      1446   anl c, COL4
+0BDC 5002      1447   jnc Keypad_Debounce
+0BDE C3        1448   clr c
+0BDF 22        1449   ret
+0BE0           1450   
+0BE0           1451   Keypad_Debounce:
+0BE0 120BA4    1452   lcall Wait25ms ; debounce
+0BE3 A2A2      1453   mov c, COL1
+0BE5 82A4      1454   anl c, COL2
+0BE7 82A6      1455   anl c, COL3
+0BE9 82B0      1456   anl c, COL4
+0BEB 5002      1457   jnc Keypad_Key_Code
+0BED C3        1458   clr c
+0BEE 22        1459   ret
+0BEF           1460   
+0BEF           1461   Keypad_Key_Code:
+0BEF D292      1462   setb ROW1
+0BF1 D294      1463   setb ROW2
+0BF3 D296      1464   setb ROW3
+0BF5 D2A0      1465   setb ROW4
+0BF7           1466   
+0BF7           1467   keypad_default:
+0BF7 C292      1468   clr ROW1
+0BF9 20A207    1469   jb COL1, CHECK_COL_37
+0BFC 7F01      1469   mov R7, #01H
+0BFE 30A2FD    1469   jnb COL1, $ ; wait for key release
+0C01 D3        1469   setb c
+0C02 22        1469   ret
+0C03           1469   CHECK_COL_37:
+0C03 20A407    1470   jb COL2, CHECK_COL_38
+0C06 7F02      1470   mov R7, #02H
+0C08 30A4FD    1470   jnb COL2, $ ; wait for key release
+0C0B D3        1470   setb c
+0C0C 22        1470   ret
+0C0D           1470   CHECK_COL_38:
+0C0D 20A607    1471   jb COL3, CHECK_COL_39
+0C10 7F03      1471   mov R7, #03H
+0C12 30A6FD    1471   jnb COL3, $ ; wait for key release
+0C15 D3        1471   setb c
+0C16 22        1471   ret
+0C17           1471   CHECK_COL_39:
+0C17 20B007    1472   jb COL4, CHECK_COL_40
+0C1A 7F0A      1472   mov R7, #0AH
+0C1C 30B0FD    1472   jnb COL4, $ ; wait for key release
+0C1F D3        1472   setb c
+0C20 22        1472   ret
+0C21           1472   CHECK_COL_40:
+0C21 D292      1473   setb ROW1
+0C23           1474   
+0C23 C294      1475   clr ROW2
+0C25 20A207    1476   jb COL1, CHECK_COL_41
+0C28 7F04      1476   mov R7, #04H
+0C2A 30A2FD    1476   jnb COL1, $ ; wait for key release
+0C2D D3        1476   setb c
+0C2E 22        1476   ret
+0C2F           1476   CHECK_COL_41:
+0C2F 20A407    1477   jb COL2, CHECK_COL_42
+0C32 7F05      1477   mov R7, #05H
+0C34 30A4FD    1477   jnb COL2, $ ; wait for key release
+0C37 D3        1477   setb c
+0C38 22        1477   ret
+0C39           1477   CHECK_COL_42:
+0C39 20A607    1478   jb COL3, CHECK_COL_43
+0C3C 7F06      1478   mov R7, #06H
+0C3E 30A6FD    1478   jnb COL3, $ ; wait for key release
+0C41 D3        1478   setb c
+0C42 22        1478   ret
+0C43           1478   CHECK_COL_43:
+0C43 20B007    1479   jb COL4, CHECK_COL_44
+0C46 7F0B      1479   mov R7, #0BH
+0C48 30B0FD    1479   jnb COL4, $ ; wait for key release
+0C4B D3        1479   setb c
+0C4C 22        1479   ret
+0C4D           1479   CHECK_COL_44:
+0C4D D294      1480   setb ROW2
+0C4F           1481   
+0C4F C296      1482   clr ROW3
+0C51 20A207    1483   jb COL1, CHECK_COL_45
+0C54 7F07      1483   mov R7, #07H
+0C56 30A2FD    1483   jnb COL1, $ ; wait for key release
+0C59 D3        1483   setb c
+0C5A 22        1483   ret
+0C5B           1483   CHECK_COL_45:
+0C5B 20A407    1484   jb COL2, CHECK_COL_46
+0C5E 7F08      1484   mov R7, #08H
+0C60 30A4FD    1484   jnb COL2, $ ; wait for key release
+0C63 D3        1484   setb c
+0C64 22        1484   ret
+0C65           1484   CHECK_COL_46:
+0C65 20A607    1485   jb COL3, CHECK_COL_47
+0C68 7F09      1485   mov R7, #09H
+0C6A 30A6FD    1485   jnb COL3, $ ; wait for key release
+0C6D D3        1485   setb c
+0C6E 22        1485   ret
+0C6F           1485   CHECK_COL_47:
+0C6F 20B007    1486   jb COL4, CHECK_COL_48
+0C72 7F0C      1486   mov R7, #0CH
+0C74 30B0FD    1486   jnb COL4, $ ; wait for key release
+0C77 D3        1486   setb c
+0C78 22        1486   ret
+0C79           1486   CHECK_COL_48:
+0C79 D296      1487   setb ROW3
+0C7B           1488   
+0C7B C2A0      1489   clr ROW4
+0C7D 20A207    1490   jb COL1, CHECK_COL_49
+0C80 7F0E      1490   mov R7, #0EH
+0C82 30A2FD    1490   jnb COL1, $ ; wait for key release
+0C85 D3        1490   setb c
+0C86 22        1490   ret
+0C87           1490   CHECK_COL_49:
+0C87 20A407    1491   jb COL2, CHECK_COL_50
+0C8A 7F00      1491   mov R7, #00H
+0C8C 30A4FD    1491   jnb COL2, $ ; wait for key release
+0C8F D3        1491   setb c
+0C90 22        1491   ret
+0C91           1491   CHECK_COL_50:
+0C91 20A607    1492   jb COL3, CHECK_COL_51
+0C94 7F0F      1492   mov R7, #0FH
+0C96 30A6FD    1492   jnb COL3, $ ; wait for key release
+0C99 D3        1492   setb c
+0C9A 22        1492   ret
+0C9B           1492   CHECK_COL_51:
+0C9B 20B007    1493   jb COL4, CHECK_COL_52
+0C9E 7F0D      1493   mov R7, #0DH
+0CA0 30B0FD    1493   jnb COL4, $ ; wait for key release
+0CA3 D3        1493   setb c
+0CA4 22        1493   ret
+0CA5           1493   CHECK_COL_52:
+0CA5 D2A0      1494   setb ROW4
+0CA7           1495   
+0CA7 C3        1496   clr c
+0CA8 22        1497   ret
+0CA9           1498   
+0CA9           1499   keypad_90deg:
+0CA9 C292      1500   clr ROW1
+0CAB 20A207    1501   jb COL1, CHECK_COL_53
+0CAE 7F0A      1501   mov R7, #0AH
+0CB0 30A2FD    1501   jnb COL1, $ ; wait for key release
+0CB3 D3        1501   setb c
+0CB4 22        1501   ret
+0CB5           1501   CHECK_COL_53:
+0CB5 20A407    1502   jb COL2, CHECK_COL_54
+0CB8 7F0B      1502   mov R7, #0BH
+0CBA 30A4FD    1502   jnb COL2, $ ; wait for key release
+0CBD D3        1502   setb c
+0CBE 22        1502   ret
+0CBF           1502   CHECK_COL_54:
+0CBF 20A607    1503   jb COL3, CHECK_COL_55
+0CC2 7F0C      1503   mov R7, #0CH
+0CC4 30A6FD    1503   jnb COL3, $ ; wait for key release
+0CC7 D3        1503   setb c
+0CC8 22        1503   ret
+0CC9           1503   CHECK_COL_55:
+0CC9 20B007    1504   jb COL4, CHECK_COL_56
+0CCC 7F0D      1504   mov R7, #0DH
+0CCE 30B0FD    1504   jnb COL4, $ ; wait for key release
+0CD1 D3        1504   setb c
+0CD2 22        1504   ret
+0CD3           1504   CHECK_COL_56:
+0CD3 D292      1505   setb ROW1
+0CD5           1506   
+0CD5 C294      1507   clr ROW2
+0CD7 20A207    1508   jb COL1, CHECK_COL_57
+0CDA 7F03      1508   mov R7, #03H
+0CDC 30A2FD    1508   jnb COL1, $ ; wait for key release
+0CDF D3        1508   setb c
+0CE0 22        1508   ret
+0CE1           1508   CHECK_COL_57:
+0CE1 20A407    1509   jb COL2, CHECK_COL_58
+0CE4 7F06      1509   mov R7, #06H
+0CE6 30A4FD    1509   jnb COL2, $ ; wait for key release
+0CE9 D3        1509   setb c
+0CEA 22        1509   ret
+0CEB           1509   CHECK_COL_58:
+0CEB 20A607    1510   jb COL3, CHECK_COL_59
+0CEE 7F09      1510   mov R7, #09H
+0CF0 30A6FD    1510   jnb COL3, $ ; wait for key release
+0CF3 D3        1510   setb c
+0CF4 22        1510   ret
+0CF5           1510   CHECK_COL_59:
+0CF5 20B007    1511   jb COL4, CHECK_COL_60
+0CF8 7F0F      1511   mov R7, #0FH
+0CFA 30B0FD    1511   jnb COL4, $ ; wait for key release
+0CFD D3        1511   setb c
+0CFE 22        1511   ret
+0CFF           1511   CHECK_COL_60:
+0CFF D294      1512   setb ROW2
+0D01           1513   
+0D01 C296      1514   clr ROW3
+0D03 20A207    1515   jb COL1, CHECK_COL_61
+0D06 7F02      1515   mov R7, #02H
+0D08 30A2FD    1515   jnb COL1, $ ; wait for key release
+0D0B D3        1515   setb c
+0D0C 22        1515   ret
+0D0D           1515   CHECK_COL_61:
+0D0D 20A407    1516   jb COL2, CHECK_COL_62
+0D10 7F05      1516   mov R7, #05H
+0D12 30A4FD    1516   jnb COL2, $ ; wait for key release
+0D15 D3        1516   setb c
+0D16 22        1516   ret
+0D17           1516   CHECK_COL_62:
+0D17 20A607    1517   jb COL3, CHECK_COL_63
+0D1A 7F08      1517   mov R7, #08H
+0D1C 30A6FD    1517   jnb COL3, $ ; wait for key release
+0D1F D3        1517   setb c
+0D20 22        1517   ret
+0D21           1517   CHECK_COL_63:
+0D21 20B007    1518   jb COL4, CHECK_COL_64
+0D24 7F00      1518   mov R7, #00H
+0D26 30B0FD    1518   jnb COL4, $ ; wait for key release
+0D29 D3        1518   setb c
+0D2A 22        1518   ret
+0D2B           1518   CHECK_COL_64:
+0D2B D296      1519   setb ROW3
+0D2D           1520   
+0D2D C2A0      1521   clr ROW4
+0D2F 20A207    1522   jb COL1, CHECK_COL_65
+0D32 7F01      1522   mov R7, #01H
+0D34 30A2FD    1522   jnb COL1, $ ; wait for key release
+0D37 D3        1522   setb c
+0D38 22        1522   ret
+0D39           1522   CHECK_COL_65:
+0D39 20A407    1523   jb COL2, CHECK_COL_66
+0D3C 7F04      1523   mov R7, #04H
+0D3E 30A4FD    1523   jnb COL2, $ ; wait for key release
+0D41 D3        1523   setb c
+0D42 22        1523   ret
+0D43           1523   CHECK_COL_66:
+0D43 20A607    1524   jb COL3, CHECK_COL_67
+0D46 7F07      1524   mov R7, #07H
+0D48 30A6FD    1524   jnb COL3, $ ; wait for key release
+0D4B D3        1524   setb c
+0D4C 22        1524   ret
+0D4D           1524   CHECK_COL_67:
+0D4D 20B007    1525   jb COL4, CHECK_COL_68
+0D50 7F0E      1525   mov R7, #0EH
+0D52 30B0FD    1525   jnb COL4, $ ; wait for key release
+0D55 D3        1525   setb c
+0D56 22        1525   ret
+0D57           1525   CHECK_COL_68:
+0D57 D2A0      1526   setb ROW4
+0D59           1527   
+0D59 C3        1528   clr c
+0D5A 22        1529   ret
+0D5B           1530   
+0D5B           1531   Get3Digits:
+0D5B C3        1532       clr c
+0D5C C0E0      1533       push acc
+0D5E C0F0      1534       push b
+0D60 C0D0      1535       push psw
+0D62           1536   
+0D62 120BBE    1537       lcall Keypad
+0D65 503C      1538       jnc G3_no_key
+0D67           1539   
+0D67 EF        1540       mov a, R7
+0D68 B40D0C    1541       cjne a, #0DH, G3_check_digit
+0D6B           1542   
+0D6B E560      1543       mov a, edit_digits
+0D6D 603C      1544       jz G3_exit
+0D6F           1545   
+0D6F D0D0      1546       pop psw
+0D71 D3        1547       setb c
+0D72 D0F0      1548       pop b
+0D74 D0E0      1549       pop acc
+0D76 22        1550       ret
+0D77           1551   
+0D77           1552   G3_check_digit:
+0D77 EF        1553       mov a, R7
+0D78 C3        1554       clr c
+0D79 940A      1555       subb a, #0Ah
+0D7B 502E      1556       jnc G3_exit
+0D7D           1557   
+0D7D E560      1558       mov a, edit_digits
+0D7F B40302    1559       cjne a, #3, G3_build
+0D82 8027      1560       sjmp G3_exit
+0D84           1561   
+0D84           1562   G3_build:
+0D84 E55F      1563       mov a, edit_value
+0D86 255F      1564       add a, edit_value
+0D88 F5F0      1565       mov b, a
+0D8A E55F      1566       mov a, edit_value
+0D8C 23        1567       rl a
+0D8D 23        1568       rl a
+0D8E 23        1569       rl a
+0D8F 25F0      1570       add a, b
+0D91 2F        1571       add a, R7
+0D92           1572   
+0D92 F55F      1573       mov edit_value, a
+0D94 0560      1574       inc edit_digits
+0D96           1575   
+0D96 E560      1576       mov a, edit_digits
+0D98 B40310    1577       cjne a, #3, G3_exit
+0D9B           1578   
+0D9B D0D0      1579       pop psw
+0D9D D3        1580       setb c
+0D9E D0F0      1581       pop b
+0DA0 D0E0      1582       pop acc
+0DA2 22        1583       ret
+0DA3           1584   
+0DA3           1585   G3_no_key:
+0DA3 D0D0      1586       pop psw
+0DA5 C3        1587       clr c
+0DA6 D0F0      1588       pop b
+0DA8 D0E0      1589       pop acc
+0DAA 22        1590       ret
+0DAB           1591   
+0DAB           1592   G3_exit:
+0DAB D0D0      1593       pop psw
+0DAD C3        1594       clr c
+0DAE D0F0      1595       pop b
+0DB0 D0E0      1596       pop acc
+0DB2 22        1597       ret
+0DB3           1598   
+0DB3           1599   ReadParamSel_SW01:
+0DB3 C0E0      1600       push acc
+0DB5 E4        1601       clr a
+0DB6 20E802    1602       jb  SWA.0, RPS_bit0_1
+0DB9 8002      1603       sjmp RPS_bit0_done
+0DBB           1604   RPS_bit0_1:
+0DBB 4401      1605       orl a, #01h
+0DBD           1606   RPS_bit0_done:
+0DBD 20E902    1607       jb  SWA.1, RPS_bit1_1
+0DC0 8002      1608       sjmp RPS_bit1_done
+0DC2           1609   RPS_bit1_1:
+0DC2 4402      1610       orl a, #02h
+0DC4           1611   RPS_bit1_done:
+0DC4 F55E      1612       mov param_sel, a
+0DC6 D0E0      1613       pop acc
+0DC8 22        1614       ret
+0DC9           1615   
+0DC9           1616   ApplyEditValue_ToSelectedParam:
+0DC9 C0E0      1617       push acc
+0DCB E55E      1618       mov a, param_sel
+0DCD B40005    1619       cjne a, #0, A1
+0DD0 855F3A    1620       mov Temp_refl, edit_value
+0DD3 8013      1621       sjmp ADone
+0DD5 B40105    1622   A1: cjne a, #1, A2
+0DD8 855F3B    1623       mov Time_refl, edit_value
+0DDB 800B      1624       sjmp ADone
+0DDD B40205    1625   A2: cjne a, #2, A3
+0DE0 855F38    1626       mov temp_soak, edit_value
+0DE3 8003      1627       sjmp ADone
+0DE5           1628   A3:
+0DE5 855F39    1629       mov Time_soak, edit_value
+0DE8           1630   ADone:
+0DE8 D0E0      1631       pop acc
+0DEA 22        1632       ret
+0DEB           1633   
+0DEB           1634   State0_DrawLCD:
+0DEB C0E0      1635       push acc
+0DED C082      1636       push dpl
+0DEF C083      1637       push dph
+0DF1 C0E0      1638            push acc
+0DF3 7401      1638            mov a, #1
+0DF5 14        1638            dec a
+0DF6 1200DC    1638            lcall ?Set_Cursor_1 ; Select column and row
+0DF9 D0E0      1638            pop acc
+0DFB C083      1639            push dph
+0DFD C082      1639            push dpl
+0DFF C0E0      1639            push acc
+0E01 900372    1639            mov dptr, #State0_Line1
+0E04 1200CF    1639            lcall ?Send_Constant_String
+0E07 D0E0      1639            pop acc
+0E09 D082      1639            pop dpl
+0E0B D083      1639            pop dph
+0E0D C0E0      1640            push acc
+0E0F 7401      1640            mov a, #1
+0E11 14        1640            dec a
+0E12 1200DA    1640            lcall ?Set_Cursor_2 ; Select column and row
+0E15 D0E0      1640            pop acc
+0E17 C083      1641            push dph
+0E19 C082      1641            push dpl
+0E1B C0E0      1641            push acc
+0E1D 900381    1641            mov dptr, #State0_Line2
+0E20 1200CF    1641            lcall ?Send_Constant_String
+0E23 D0E0      1641            pop acc
+0E25 D082      1641            pop dpl
+0E27 D083      1641            pop dph
+0E29 C0E0      1642            push acc
+0E2B 7401      1642            mov a, #1
+0E2D 14        1642            dec a
+0E2E 1200DA    1642            lcall ?Set_Cursor_2 ; Select column and row
+0E31 D0E0      1642            pop acc
+0E33 E53A      1643       mov a, Temp_refl
+0E35 120B6C    1644       lcall LCD_Print3Dec
+0E38 C0E0      1645            push acc
+0E3A 7405      1645            mov a, #5
+0E3C 14        1645            dec a
+0E3D 1200DA    1645            lcall ?Set_Cursor_2 ; Select column and row
+0E40 D0E0      1645            pop acc
+0E42 E53B      1646       mov a, Time_refl
+0E44 120B6C    1647       lcall LCD_Print3Dec
+0E47 C0E0      1648            push acc
+0E49 7409      1648            mov a, #9
+0E4B 14        1648            dec a
+0E4C 1200DA    1648            lcall ?Set_Cursor_2 ; Select column and row
+0E4F D0E0      1648            pop acc
+0E51 E538      1649       mov a, temp_soak
+0E53 120B6C    1650       lcall LCD_Print3Dec
+0E56 C0E0      1651            push acc
+0E58 740D      1651            mov a, #13
+0E5A 14        1651            dec a
+0E5B 1200DA    1651            lcall ?Set_Cursor_2 ; Select column and row
+0E5E D0E0      1651            pop acc
+0E60           1651   
+0E60 E539      1652       mov a, Time_soak
+0E62 120B6C    1653       lcall LCD_Print3Dec
+0E65 D083      1654       pop dph
+0E67 D082      1655       pop dpl
+0E69 D0E0      1656       pop acc
+0E6B 22        1657       ret
+0E6C           1658   
+0E6C           1659   KeyLED_LUT:
+0E6C 0100      1660       DB 01h,00h
+0E6E 0200      1661       DB 02h,00h
+0E70 0400      1662       DB 04h,00h
+0E72 0800      1663       DB 08h,00h
+0E74 1000      1664       DB 10h,00h
+0E76 2000      1665       DB 20h,00h
+0E78 4000      1666       DB 40h,00h
+0E7A 8000      1667       DB 80h,00h
+0E7C 0001      1668       DB 00h,01h
+0E7E 0002      1669       DB 00h,02h
+0E80 0004      1670       DB 00h,04h
+0E82 0008      1671       DB 00h,08h
+0E84 0010      1672       DB 00h,10h
+0E86 0020      1673       DB 00h,20h
+0E88 0040      1674       DB 00h,40h
+0E8A 0080      1675       DB 00h,80h
+0E8C           1676   
+0E8C           1677   Keypad_Test_LEDs:
+0E8C C0E0      1678       push acc
+0E8E C082      1679       push dpl
+0E90 C083      1680       push dph
+0E92           1681   
+0E92 120BBE    1682       lcall Keypad
+0E95 5016      1683       jnc KTL_no_key
+0E97           1684   
+0E97 EF        1685       mov a, R7
+0E98 C3        1686       clr c
+0E99 9410      1687       subb a, #10h
+0E9B 5010      1688       jnc KTL_done
+0E9D           1689   
+0E9D 900E6C    1690       mov dptr, #KeyLED_LUT
+0EA0 EF        1691       mov a, R7
+0EA1 23        1692       rl a
+0EA2 93        1693       movc a, @a+dptr
+0EA3 F5E8      1694       mov LEDRA, a
+0EA5 EF        1695       mov a, R7
+0EA6 23        1696       rl a
+0EA7 04        1697       inc a
+0EA8 93        1698       movc a, @a+dptr
+0EA9 F595      1699       mov LEDRB, a
+0EAB 8000      1700       sjmp KTL_done
+0EAD           1701   
+0EAD           1702   KTL_no_key:
+0EAD           1703   
+0EAD           1704   KTL_done:
+0EAD D083      1705       pop dph
+0EAF D082      1706       pop dpl
+0EB1 D0E0      1707       pop acc
+0EB3 22        1708       ret
+0EB4           1709   
+0EB4           1710   ; ==========================================================
+0EB4           1711   ; ADXL345 SPI + Tilt Abort Feature
+0EB4           1712   ; ==========================================================
+0EB4           1713   
+0EB4           1714   SPI_ByteRW:
+0EB4 7E08      1715       mov   R6, #8
+0EB6 7F00      1716       mov   R7, #0
+0EB8           1717   
+0EB8           1718   SPI_Loop:
+0EB8 A2E7      1719       mov   C, ACC.7
+0EBA 92FD      1720       mov   GSENSOR_SDI, C
+0EBC           1721   
+0EBC C2FE      1722       clr   GSENSOR_SCLK
+0EBE 23        1723       rl    A
+0EBF           1724   
+0EBF D2FE      1725       setb  GSENSOR_SCLK
+0EC1 A2FD      1726       mov   C, GSENSOR_SDO
+0EC3 C0E0      1727       push  acc
+0EC5 EF        1728       mov   a, R7
+0EC6 33        1729       rlc   a
+0EC7 FF        1730       mov   R7, a
+0EC8 D0E0      1731       pop   acc
+0ECA           1732   
+0ECA DEEC      1733       djnz  R6, SPI_Loop
+0ECC EF        1734       mov   a, R7
+0ECD 22        1735       ret
+0ECE           1736   
+0ECE           1737   ADXL345_WriteReg:
+0ECE D2FE      1738       setb  GSENSOR_SCLK
+0ED0 C2FF      1739       clr   GSENSOR_CS_n
+0ED2 E8        1740       mov   A, R0
+0ED3 543F      1741       anl   A, #3Fh
+0ED5 120EB4    1742       lcall SPI_ByteRW
+0ED8 E9        1743       mov   A, R1
+0ED9 120EB4    1744       lcall SPI_ByteRW
+0EDC D2FF      1745       setb  GSENSOR_CS_n
+0EDE 22        1746       ret
+0EDF           1747   
+0EDF           1748   ADXL345_ReadReg:
+0EDF D2FE      1749       setb  GSENSOR_SCLK
+0EE1 C2FF      1750       clr   GSENSOR_CS_n
+0EE3 4480      1751       orl   A, #80h
+0EE5 120EB4    1752       lcall SPI_ByteRW
+0EE8 7400      1753       mov   A, #00h
+0EEA 120EB4    1754       lcall SPI_ByteRW
+0EED D2FF      1755       setb  GSENSOR_CS_n
+0EEF 22        1756       ret
+0EF0           1757   
+0EF0           1758   ADXL345_ReadXYZ:
+0EF0 D2FE      1759       setb  GSENSOR_SCLK
+0EF2 C2FF      1760       clr   GSENSOR_CS_n
+0EF4           1761   
+0EF4 74F2      1762       mov   A, #0F2h
+0EF6 120EB4    1763       lcall SPI_ByteRW
+0EF9           1764   
+0EF9 7400      1765       mov   A, #00h
+0EFB 120EB4    1766       lcall SPI_ByteRW
+0EFE F562      1767       mov ax_l, A
+0F00           1768   
+0F00 7400      1769       mov   A, #00h
+0F02 120EB4    1770       lcall SPI_ByteRW
+0F05 F563      1771       mov ax_h, A
+0F07           1772   
+0F07 7400      1773       mov   A, #00h
+0F09 120EB4    1774       lcall SPI_ByteRW
+0F0C F564      1775       mov ay_l, A
+0F0E           1776   
+0F0E 7400      1777       mov   A, #00h
+0F10 120EB4    1778       lcall SPI_ByteRW
+0F13 F565      1779       mov ay_h, A
+0F15           1780   
+0F15 7400      1781       mov   A, #00h
+0F17 120EB4    1782       lcall SPI_ByteRW
+0F1A F566      1783       mov az_l, A
+0F1C           1784   
+0F1C 7400      1785       mov   A, #00h
+0F1E 120EB4    1786       lcall SPI_ByteRW
+0F21 F567      1787       mov az_h, A
+0F23           1788   
+0F23 D2FF      1789       setb  GSENSOR_CS_n
+0F25 22        1790       ret
+0F26           1791   
+0F26           1792   ADXL345_Configure:
+0F26 7831      1793       mov R0, #31h
+0F28 7908      1794       mov R1, #08h
+0F2A 120ECE    1795       lcall ADXL345_WriteReg
+0F2D           1796   
+0F2D 782D      1797       mov R0, #2Dh
+0F2F 7908      1798       mov R1, #08h
+0F31 120ECE    1799       lcall ADXL345_WriteReg
+0F34 22        1800       ret
+0F35           1801   
+0F35           1802   Abs16_R3R2:
+0F35 EB        1803       mov a, R3
+0F36 20E701    1804       jb  acc.7, abs_neg
+0F39 22        1805       ret
+0F3A           1806   abs_neg:
+0F3A EA        1807       mov a, R2
+0F3B F4        1808       cpl a
+0F3C FA        1809       mov R2, a
+0F3D EB        1810       mov a, R3
+0F3E F4        1811       cpl a
+0F3F FB        1812       mov R3, a
+0F40 0A        1813       inc R2
+0F41 EA        1814       mov a, R2
+0F42 7001      1815       jnz abs_done
+0F44 0B        1816       inc R3
+0F45           1817   abs_done:
+0F45 22        1818       ret
+0F46           1819   
+0F46           1820   Check_Tilt_Abort:
+0F46 C0E0      1821       push acc
+0F48 C0D0      1822       push psw
+0F4A           1823       ; force bank0 so we can safely push/pop R2,R3,R6,R7 by address
+0F4A 53D0E7    1824       anl PSW, #0E7h
+0F4D           1825   
+0F4D C0F0      1826       push b
+0F4F C082      1827       push dpl
+0F51 C083      1828       push dph
+0F53 C002      1829       push 02h      ; R2 (bank0)
+0F55 C003      1830       push 03h      ; R3 (bank0)
+0F57 C006      1831       push 06h      ; R6 (bank0)
+0F59 C007      1832       push 07h      ; R7 (bank0)
+0F5B           1833   
+0F5B E537      1834       mov a, FSM1_state
+0F5D 603D      1835       jz  CTA_done
+0F5F           1836   
+0F5F 120EF0    1837       lcall ADXL345_ReadXYZ
+0F62           1838   
+0F62           1839       ; abs(X)
+0F62 AA62      1840       mov R2, ax_l
+0F64 AB63      1841       mov R3, ax_h
+0F66 120F35    1842       lcall Abs16_R3R2
+0F69           1843   
+0F69 EB        1844       mov a, R3
+0F6A C3        1845       clr c
+0F6B 9400      1846       subb a, #TILT_TH_HI
+0F6D 4008      1847       jc  CTA_checkY
+0F6F 701D      1848       jnz CTA_abort
+0F71 EA        1849       mov a, R2
+0F72 C3        1850       clr c
+0F73 94C0      1851       subb a, #TILT_TH_LO
+0F75 5017      1852       jnc CTA_abort
+0F77           1853   
+0F77           1854   CTA_checkY:
+0F77           1855       ; abs(Y)
+0F77 AA64      1856       mov R2, ay_l
+0F79 AB65      1857       mov R3, ay_h
+0F7B 120F35    1858       lcall Abs16_R3R2
+0F7E           1859   
+0F7E EB        1860       mov a, R3
+0F7F C3        1861       clr c
+0F80 9400      1862       subb a, #TILT_TH_HI
+0F82 4018      1863       jc  CTA_done
+0F84 7008      1864       jnz CTA_abort
+0F86 EA        1865       mov a, R2
+0F87 C3        1866       clr c
+0F88 94C0      1867       subb a, #TILT_TH_LO
+0F8A 5002      1868       jnc CTA_abort
+0F8C 800E      1869       sjmp CTA_done
+0F8E           1870   
+0F8E           1871   CTA_abort:
+0F8E 753D00    1872       mov pwm, #0
+0F91 C2B7      1873       clr SSR_PIN
+0F93 753706    1874       mov FSM1_state, #6
+0F96 756801    1875       mov tilt_fault, #1
+0F99 120990    1876       lcall ten_beeps
+0F9C           1877   
+0F9C           1878   CTA_done:
+0F9C D007      1879       pop 07h
+0F9E D006      1880       pop 06h
+0FA0 D003      1881       pop 03h
+0FA2 D002      1882       pop 02h
+0FA4 D083      1883       pop dph
+0FA6 D082      1884       pop dpl
+0FA8 D0F0      1885       pop b
+0FAA D0D0      1886       pop psw
+0FAC D0E0      1887       pop acc
+0FAE 22        1888       ret
+0FAF           1889      
+0FAF           1890      
+0FAF           1891   send_all_serial_3digits:
+0FAF C0E0      1892       push acc
+0FB1 C0F0      1893       push b
+0FB3 C082      1894       push dpl
+0FB5 C083      1895       push dph
+0FB7           1896   
+0FB7           1897       ; -------- TEMP = t_hot / 100 (same as your working code) --------
+0FB7 855843    1898       mov x+0, t_hot+0
+0FBA 855944    1899       mov x+1, t_hot+1
+0FBD 855A45    1900       mov x+2, t_hot+2
+0FC0 855B46    1901       mov x+3, t_hot+3
+0FC3           1902   
+0FC3 754764    1903            mov y+0, #low (100 % 0x10000) 
+0FC6 754800    1903            mov y+1, #high(100 % 0x10000) 
+0FC9 754900    1903            mov y+2, #low (100 / 0x10000) 
+0FCC 754A00    1903            mov y+3, #high(100 / 0x10000) 
+0FCF 1202FE    1904       lcall div32
+0FD2 85433E    1905       mov temp, x+0              ; integer degC (0..255)
+0FD5           1906   
+0FD5           1907       ; -------- print TEMP --------
+0FD5 E53E      1908       mov a, temp
+0FD7 FC        1909       mov R4, a
+0FD8 7B00      1910       mov R3, #0
+0FDA 7A00      1911       mov R2, #0
+0FDC           1912   HUND_LOOP_T:
+0FDC EB        1913       mov a, R3
+0FDD 7006      1914       jnz HUND_SUB_T
+0FDF EC        1915       mov a, R4
+0FE0 C3        1916       clr c
+0FE1 9464      1917       subb a, #100
+0FE3 400C      1918       jc  HUND_DONE_T
+0FE5           1919   HUND_SUB_T:
+0FE5 EC        1920       mov a, R4
+0FE6 C3        1921       clr c
+0FE7 9464      1922       subb a, #100
+0FE9 FC        1923       mov R4, a
+0FEA EB        1924       mov a, R3
+0FEB 9400      1925       subb a, #0
+0FED FB        1926       mov R3, a
+0FEE 0A        1927       inc R2
+0FEF 80EB      1928       sjmp HUND_LOOP_T
+0FF1           1929   HUND_DONE_T:
+0FF1 EA        1930       mov a, R2
+0FF2 2430      1931       add a, #'0'
+0FF4 120964    1932       lcall putchar
+0FF7 EC        1933       mov a, R4
+0FF8 75F00A    1934       mov b, #10
+0FFB 84        1935       div ab
+0FFC 2430      1936       add a, #'0'
+0FFE 120964    1937       lcall putchar
+1001 E5F0      1938       mov a, b
+1003 2430      1939       add a, #'0'
+1005 120964    1940       lcall putchar
+1008           1941   
+1008 7420      1942       mov a, #' '
+100A 120964    1943       lcall putchar
+100D           1944   
+100D           1945       ; -------- print temp_soak --------
+100D E538      1946       mov a, temp_soak
+100F FC        1947       mov R4, a
+1010 7B00      1948       mov R3, #0
+1012 7A00      1949       mov R2, #0
+1014           1950   HUND_LOOP_SOT:
+1014 EB        1951       mov a, R3
+1015 7006      1952       jnz HUND_SUB_SOT
+1017 EC        1953       mov a, R4
+1018 C3        1954       clr c
+1019 9464      1955       subb a, #100
+101B 400C      1956       jc  HUND_DONE_SOT
+101D           1957   HUND_SUB_SOT:
+101D EC        1958       mov a, R4
+101E C3        1959       clr c
+101F 9464      1960       subb a, #100
+1021 FC        1961       mov R4, a
+1022 EB        1962       mov a, R3
+1023 9400      1963       subb a, #0
+1025 FB        1964       mov R3, a
+1026 0A        1965       inc R2
+1027 80EB      1966       sjmp HUND_LOOP_SOT
+1029           1967   HUND_DONE_SOT:
+1029 EA        1968       mov a, R2
+102A 2430      1969       add a, #'0'
+102C 120964    1970       lcall putchar
+102F EC        1971       mov a, R4
+1030 75F00A    1972       mov b, #10
+1033 84        1973       div ab
+1034 2430      1974       add a, #'0'
+1036 120964    1975       lcall putchar
+1039 E5F0      1976       mov a, b
+103B 2430      1977       add a, #'0'
+103D 120964    1978       lcall putchar
+1040           1979   
+1040 7420      1980       mov a, #' '
+1042 120964    1981       lcall putchar
+1045           1982   
+1045           1983       ; -------- print time_soak --------
+1045 E539      1984       mov a, time_soak
+1047 FC        1985       mov R4, a
+1048 7B00      1986       mov R3, #0
+104A 7A00      1987       mov R2, #0
+104C           1988   HUND_LOOP_SOK:
+104C EB        1989       mov a, R3
+104D 7006      1990       jnz HUND_SUB_SOK
+104F EC        1991       mov a, R4
+1050 C3        1992       clr c
+1051 9464      1993       subb a, #100
+1053 400C      1994       jc  HUND_DONE_SOK
+1055           1995   HUND_SUB_SOK:
+1055 EC        1996       mov a, R4
+1056 C3        1997       clr c
+1057 9464      1998       subb a, #100
+1059 FC        1999       mov R4, a
+105A EB        2000       mov a, R3
+105B 9400      2001       subb a, #0
+105D FB        2002       mov R3, a
+105E 0A        2003       inc R2
+105F 80EB      2004       sjmp HUND_LOOP_SOK
+1061           2005   HUND_DONE_SOK:
+1061 EA        2006       mov a, R2
+1062 2430      2007       add a, #'0'
+1064 120964    2008       lcall putchar
+1067 EC        2009       mov a, R4
+1068 75F00A    2010       mov b, #10
+106B 84        2011       div ab
+106C 2430      2012       add a, #'0'
+106E 120964    2013       lcall putchar
+1071 E5F0      2014       mov a, b
+1073 2430      2015       add a, #'0'
+1075 120964    2016       lcall putchar
+1078           2017   
+1078 7420      2018       mov a, #' '
+107A 120964    2019       lcall putchar
+107D           2020   
+107D           2021       ; -------- print temp_refl --------
+107D E53A      2022       mov a, temp_refl
+107F FC        2023       mov R4, a
+1080 7B00      2024       mov R3, #0
+1082 7A00      2025       mov R2, #0
+1084           2026   HUND_LOOP_RFT:
+1084 EB        2027       mov a, R3
+1085 7006      2028       jnz HUND_SUB_RFT
+1087 EC        2029       mov a, R4
+1088 C3        2030       clr c
+1089 9464      2031       subb a, #100
+108B 400C      2032       jc  HUND_DONE_RFT
+108D           2033   HUND_SUB_RFT:
+108D EC        2034       mov a, R4
+108E C3        2035       clr c
+108F 9464      2036       subb a, #100
+1091 FC        2037       mov R4, a
+1092 EB        2038       mov a, R3
+1093 9400      2039       subb a, #0
+1095 FB        2040       mov R3, a
+1096 0A        2041       inc R2
+1097 80EB      2042       sjmp HUND_LOOP_RFT
+1099           2043   HUND_DONE_RFT:
+1099 EA        2044       mov a, R2
+109A 2430      2045       add a, #'0'
+109C 120964    2046       lcall putchar
+109F EC        2047       mov a, R4
+10A0 75F00A    2048       mov b, #10
+10A3 84        2049       div ab
+10A4 2430      2050       add a, #'0'
+10A6 120964    2051       lcall putchar
+10A9 E5F0      2052       mov a, b
+10AB 2430      2053       add a, #'0'
+10AD 120964    2054       lcall putchar
+10B0           2055   
+10B0 7420      2056       mov a, #' '
+10B2 120964    2057       lcall putchar
+10B5           2058   
+10B5           2059       ; -------- print time_refl --------
+10B5 E53B      2060       mov a, time_refl
+10B7 FC        2061       mov R4, a
+10B8 7B00      2062       mov R3, #0
+10BA 7A00      2063       mov R2, #0
+10BC           2064   HUND_LOOP_RFK:
+10BC EB        2065       mov a, R3
+10BD 7006      2066       jnz HUND_SUB_RFK
+10BF EC        2067       mov a, R4
+10C0 C3        2068       clr c
+10C1 9464      2069       subb a, #100
+10C3 400C      2070       jc  HUND_DONE_RFK
+10C5           2071   HUND_SUB_RFK:
+10C5 EC        2072       mov a, R4
+10C6 C3        2073       clr c
+10C7 9464      2074       subb a, #100
+10C9 FC        2075       mov R4, a
+10CA EB        2076       mov a, R3
+10CB 9400      2077       subb a, #0
+10CD FB        2078       mov R3, a
+10CE 0A        2079       inc R2
+10CF 80EB      2080       sjmp HUND_LOOP_RFK
+10D1           2081   HUND_DONE_RFK:
+10D1 EA        2082       mov a, R2
+10D2 2430      2083       add a, #'0'
+10D4 120964    2084       lcall putchar
+10D7 EC        2085       mov a, R4
+10D8 75F00A    2086       mov b, #10
+10DB 84        2087       div ab
+10DC 2430      2088       add a, #'0'
+10DE 120964    2089       lcall putchar
+10E1 E5F0      2090       mov a, b
+10E3 2430      2091       add a, #'0'
+10E5 120964    2092       lcall putchar
+10E8           2093   
+10E8           2094       ; -------- CRLF --------
+10E8 740D      2095       mov a, #0Dh
+10EA 120964    2096       lcall putchar
+10ED 740A      2097       mov a, #0Ah
+10EF 120964    2098       lcall putchar
+10F2           2099   
+10F2 D083      2100       pop dph
+10F4 D082      2101       pop dpl
+10F6 D0F0      2102       pop b
+10F8 D0E0      2103       pop acc
+10FA 22        2104       ret
+10FB           2105   
+10FB           2106   
+10FB           2107   en
